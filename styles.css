@@ -85,7 +85,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .nav a:hover, .nav-lock:hover { background: rgba(255, 255, 255, .06); color: #fff; }
 .nav a.active { background: rgba(216, 181, 108, .16); color: #f1d99f; }
 .nav-lock { margin-top: auto; }
-main { flex: 1; min-width: 0; padding: 32px 40px 60px; max-width: 1280px; outline: none; }
+main { flex: 1; min-width: 0; padding: 32px 40px 60px; max-width: 1180px; margin: 0 auto; outline: none; }
 
 @media (max-width: 760px) {
   .shell { display: block; }
