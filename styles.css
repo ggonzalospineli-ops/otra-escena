@@ -349,3 +349,15 @@ details .stack { gap: 12px; }
 .about { text-align: center; }
 .about .dedicatoria { color: var(--ink); }
 .about .dedicatoria-firma { color: var(--gold); }
+
+/* ---------- Tablet: menú angosto de íconos ---------- */
+@media (min-width: 761px) and (max-width: 1100px) {
+  .nav { width: 84px; padding: 20px 8px; align-items: stretch; }
+  .brand { justify-content: center; padding: 4px 0 18px; }
+  .brand span:last-child { display: none; }
+  .nav a, .nav-lock { flex-direction: column; gap: 4px; padding: 10px 4px; font-size: 11px; text-align: center; align-items: center; }
+  .nav a svg, .nav-lock svg { width: 22px; height: 22px; }
+  main { padding: 28px 28px 50px; }
+  .week { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .day { min-height: 120px; }
+}
