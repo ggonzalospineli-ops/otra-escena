@@ -450,6 +450,18 @@ VIEWS.inicio = {
     const lb = db.settings.lastBackup;
     const needBackup = (db.sessions.length + db.patients.length) > 0 && (!lb || (Date.now() - new Date(lb)) > 14 * 864e5);
 
+    const semanaDias = [...Array(7)].map((_, i) => addDays(startOfWeek(now), i));
+    const weekPanel = `<div class="card week-mini">
+        <div class="section-title" style="margin-bottom:6px"><h3>Esta semana</h3><span class="spacer"></span><a class="btn small ghost" href="#/agenda">Agenda ›</a></div>
+        ${semanaDias.map(d => {
+      const f = ymd(d), ss = sessionsOn(f).filter(s => s.estado !== 'cancelada');
+      return `<a class="wm-day ${f === today ? 'today' : ''} ${f < today ? 'past' : ''}" href="#/agenda/${f}">
+            <span class="wm-name">${d.toLocaleDateString('es-AR', { weekday: 'short' })} ${d.getDate()}</span>
+            <span class="wm-list">${ss.length ? ss.map(s => `<span><b>${esc(s.hora || '—')}</b> ${esc(displayName(patientById(s.patientId)))}</span>`).join('') : '<span class="muted">—</span>'}</span>
+          </a>`;
+    }).join('')}
+      </div>`;
+
     return `
       <section class="hero sky-${phase}">
         <div class="hero-top"><span class="hero-emoji">${emoji}</span>
@@ -457,35 +469,45 @@ VIEWS.inicio = {
         <h1>${saludo}, ${esc(db.settings.nombre || 'Nico')}</h1>
         <p class="fecha">${fmtFecha(today)}${db.settings.titulo ? ' · ' + esc(db.settings.titulo) : ''}</p>
       </section>
-      ${quoteHTML(quoteOfDay())}
-      ${db.borrador ? `<div class="banner"><p>Quedó un borrador de sesión sin guardar cuando se bloqueó la app.</p>
-        <button class="btn small primary" data-act="restore-draft">Recuperar</button><button class="btn small ghost" data-act="discard-draft">Descartar</button></div>` : ''}
-      ${needBackup ? `<div class="banner"><p>${lb ? 'Hace más de dos semanas que no hacés un backup.' : 'Todavía no hiciste ningún backup.'} Si se pierde o se rompe el dispositivo, es la única copia.</p>
-        <button class="btn small primary" data-act="export">Hacer backup</button></div>` : ''}
 
-      <div class="section">
-        <div class="section-title"><h2>Hoy</h2><small>${hoy.length ? hoy.length + (hoy.length === 1 ? ' sesión' : ' sesiones') : ''}</small>
-          <span class="spacer"></span><button class="btn small primary" data-act="new-session" data-fecha="${today}">+ Sesión</button></div>
-        ${hoy.length ? `<div class="slist">${hoy.map(s => sessionRow(s)).join('')}</div>`
+      <div class="home">
+        <div class="home-top">
+          ${quoteHTML(quoteOfDay())}
+          ${db.borrador ? `<div class="banner"><p>Quedó un borrador de sesión sin guardar cuando se bloqueó la app.</p>
+            <button class="btn small primary" data-act="restore-draft">Recuperar</button><button class="btn small ghost" data-act="discard-draft">Descartar</button></div>` : ''}
+          ${needBackup ? `<div class="banner"><p>${lb ? 'Hace más de dos semanas que no hacés un backup.' : 'Todavía no hiciste ningún backup.'} Si se pierde o se rompe el dispositivo, es la única copia.</p>
+            <button class="btn small primary" data-act="export">Hacer backup</button></div>` : ''}
+        </div>
+
+        <div class="home-main">
+          <div class="section">
+            <div class="section-title"><h2>Hoy</h2><small>${hoy.length ? hoy.length + (hoy.length === 1 ? ' sesión' : ' sesiones') : ''}</small>
+              <span class="spacer"></span><button class="btn small primary" data-act="new-session" data-fecha="${today}">+ Sesión</button></div>
+            ${hoy.length ? `<div class="slist">${hoy.map(s => sessionRow(s)).join('')}</div>`
         : `<p class="empty">${esc(EMPTY_TODAY[dayOfYear() % EMPTY_TODAY.length])}</p>`}
+          </div>
+
+          ${sinRegistrar.length ? `<div class="section">
+            <div class="section-title"><h2>Para completar</h2><small>sesiones pasadas que siguen como programadas</small></div>
+            <div class="slist">${sinRegistrar.slice(0, 6).map(s => sessionRow(s, { showDate: true })).join('')}</div></div>` : ''}
+
+          ${proximas.length ? `<div class="section"><div class="section-title"><h2>Próximas</h2></div>
+            <div class="slist">${proximas.map(s => sessionRow(s, { showDate: true })).join('')}</div></div>` : ''}
+
+          ${!db.patients.length ? `<div class="section card"><h3>Para empezar</h3>
+            <p class="muted">Cargá tu primer paciente. Después vas a poder agendar sesiones, tomar notas y llevar los honorarios.</p>
+            <button class="btn primary" data-act="new-patient">+ Nuevo paciente</button></div>` : ''}
+        </div>
+
+        <div class="home-side">
+          <div class="stats">
+            <div class="stat"><div class="v">${semana}</div><div class="l">sesiones esta semana</div></div>
+            <div class="stat"><div class="v">${activos}</div><div class="l">pacientes en tratamiento</div></div>
+            <div class="stat ${pendiente ? 'warn' : 'ok'}"><div class="v">${money(pendiente)}</div><div class="l">pendiente de cobro</div></div>
+          </div>
+          ${weekPanel}
+        </div>
       </div>
-
-      ${sinRegistrar.length ? `<div class="section">
-        <div class="section-title"><h2>Para completar</h2><small>sesiones pasadas que siguen como programadas</small></div>
-        <div class="slist">${sinRegistrar.slice(0, 6).map(s => sessionRow(s, { showDate: true })).join('')}</div></div>` : ''}
-
-      <div class="section stats">
-        <div class="stat"><div class="v">${semana}</div><div class="l">sesiones esta semana</div></div>
-        <div class="stat"><div class="v">${activos}</div><div class="l">pacientes en tratamiento</div></div>
-        <div class="stat ${pendiente ? 'warn' : 'ok'}"><div class="v">${money(pendiente)}</div><div class="l">pendiente de cobro</div></div>
-      </div>
-
-      ${proximas.length ? `<div class="section"><div class="section-title"><h2>Próximas</h2></div>
-        <div class="slist">${proximas.map(s => sessionRow(s, { showDate: true })).join('')}</div></div>` : ''}
-
-      ${!db.patients.length ? `<div class="section card"><h3>Para empezar</h3>
-        <p class="muted">Cargá tu primer paciente. Después vas a poder agendar sesiones, tomar notas y llevar los honorarios.</p>
-        <button class="btn primary" data-act="new-patient">+ Nuevo paciente</button></div>` : ''}
     `;
   },
 };

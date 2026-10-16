@@ -85,7 +85,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .nav a:hover, .nav-lock:hover { background: rgba(255, 255, 255, .06); color: #fff; }
 .nav a.active { background: rgba(216, 181, 108, .16); color: #f1d99f; }
 .nav-lock { margin-top: auto; }
-main { flex: 1; min-width: 0; padding: 32px 40px 60px; max-width: 1180px; margin: 0 auto; outline: none; }
+main { flex: 1; min-width: 0; padding: 32px 48px 60px; max-width: 1640px; margin: 0 auto; outline: none; }
 
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -360,4 +360,31 @@ details .stack { gap: 12px; }
   main { padding: 28px 28px 50px; }
   .week { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .day { min-height: 120px; }
+}
+
+/* ---------- Inicio en dos columnas ---------- */
+.home { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 32px; }
+.home-side { display: flex; flex-direction: column; gap: 16px; margin-top: 28px; }
+.week-mini { padding: 14px 16px; }
+.wm-day { display: flex; gap: 12px; padding: 8px 6px; border-top: 1px solid var(--line); text-decoration: none; color: inherit; border-radius: 6px; }
+.wm-day:hover { background: var(--surface-2); }
+.wm-day.today .wm-name { color: var(--gold); font-weight: 600; }
+.wm-day.past { opacity: .6; }
+.wm-name { width: 64px; flex: none; font-family: var(--serif); font-size: 1.05rem; }
+.wm-name::first-letter { text-transform: uppercase; }
+.wm-list { display: flex; flex-direction: column; gap: 2px; font-size: .88rem; min-width: 0; }
+.wm-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (min-width: 1200px) {
+  .home { grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); grid-template-rows: auto 1fr; }
+  .home-top { grid-column: 2; grid-row: 1; }
+  .home-main { grid-column: 1; grid-row: 1 / span 2; }
+  .home-side { grid-column: 2; grid-row: 2; margin-top: 18px; }
+  .home-side .stats { grid-template-columns: 1fr 1fr; }
+  .home-side .stat:last-child { grid-column: 1 / -1; }
+  .home-top .cita { margin-top: 28px; }
+}
+@media (min-width: 1600px) {
+  body { font-size: 16px; }
+  h1 { font-size: 2.4rem; }
+  .hero h1 { font-size: 2.8rem; }
 }
