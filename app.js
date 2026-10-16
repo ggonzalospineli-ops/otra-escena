@@ -100,15 +100,42 @@ async function deriveKey(pass, saltB64, iter) {
     base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
 function newKdf() { return { name: 'PBKDF2-SHA256', iter: KDF_ITER, salt: b64(crypto.getRandomValues(new Uint8Array(16))) }; }
-async function seal(obj, k, kdf) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, te.encode(JSON.stringify(obj)));
-  return { app: 'otra-escena', v: 1, kdf, iv: b64(iv), ct: b64(ct), savedAt: new Date().toISOString() };
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+const b64u = buf => b64(buf).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const importAes = raw => crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
+async function aesEnc(k, bytes) { const iv = rand(12); return { iv: b64(iv), ct: b64(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k, bytes)) }; }
+async function aesDec(k, box) { return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(box.iv) }, k, unb64(box.ct))); }
+async function hkdf(raw, info) {
+  const base = await crypto.subtle.importKey('raw', raw, 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: te.encode(info) }, base, 256));
+}
+// Una clave de datos aleatoria cifra todo. La contraseña (y Face ID, si está activo) solo la "envuelven",
+// así se puede cambiar la contraseña o sumar dispositivos sin volver a cifrar los datos.
+async function keysFromRaw(raw, kdf, wpw) { return { raw, aes: await importAes(raw), kdf, wpw }; }
+async function newKeys(pass) {
+  const kdf = newKdf(), raw = rand(32);
+  return keysFromRaw(raw, kdf, await aesEnc(await deriveKey(pass, kdf.salt, kdf.iter), raw));
+}
+async function rewrapKeys(k, pass) {
+  const kdf = newKdf();
+  return { ...k, kdf, wpw: await aesEnc(await deriveKey(pass, kdf.salt, kdf.iter), k.raw) };
+}
+async function seal(obj, k) {
+  const box = await aesEnc(k.aes, te.encode(JSON.stringify(obj)));
+  return { app: 'otra-escena', v: 2, kdf: k.kdf, wpw: k.wpw, ...box, savedAt: new Date().toISOString() };
+}
+async function openWithRaw(vault, raw) {
+  const k = await keysFromRaw(raw, vault.kdf, vault.wpw);
+  return { data: JSON.parse(td.decode(await aesDec(k.aes, vault))), keys: k };
 }
 async function unseal(vault, pass) {
-  const k = await deriveKey(pass, vault.kdf.salt, vault.kdf.iter);
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(vault.iv) }, k, unb64(vault.ct));
-  return { data: JSON.parse(td.decode(pt)), key: k };
+  const kek = await deriveKey(pass, vault.kdf.salt, vault.kdf.iter);
+  if (!vault.wpw) { // formato v1: la contraseña cifraba los datos directamente
+    const data = JSON.parse(td.decode(await aesDec(kek, vault)));
+    const raw = rand(32);
+    return { data, keys: await keysFromRaw(raw, vault.kdf, await aesEnc(kek, raw)) };
+  }
+  return openWithRaw(vault, await aesDec(kek, vault.wpw));
 }
 
 /* ---------- Almacenamiento (IndexedDB) ---------- */
@@ -131,12 +158,15 @@ const idb = {
     const d = await this.conn();
     return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
   },
+  async del(k) {
+    const d = await this.conn();
+    return new Promise((res, rej) => { const t = d.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); });
+  },
 };
 
 /* ---------- Estado ---------- */
 let db = null;      // datos descifrados (solo en memoria mientras está desbloqueado)
-let key = null;     // CryptoKey
-let kdf = null;     // { salt, iter } del vault actual
+let keys = null;    // { raw, aes, kdf, wpw }: clave de datos y su versión envuelta con la contraseña
 let saveTimer = null, saving = Promise.resolve();
 let lastActivity = Date.now();
 
@@ -147,6 +177,7 @@ function defaultDB(nombre, titulo) {
     patients: [],
     sessions: [],
     borrador: null,
+    _local: {},
   };
 }
 function migrate(d) {
@@ -154,17 +185,20 @@ function migrate(d) {
   d.settings = { ...base.settings, ...(d.settings || {}) };
   d.patients ||= []; d.sessions ||= [];
   if (d.borrador === undefined) d.borrador = null;
+  d._local ||= {};
   return d;
 }
 
+function scheduleSync() { /* la sincronización entre dispositivos todavía no está activa */ }
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 250); }
 function persist() {
   clearTimeout(saveTimer);
-  if (!db || !key) return saving;
-  const snapshot = db, k = key, meta = kdf;
-  saving = saving.then(async () => idb.set('vault', await seal(snapshot, k, meta))).catch(err => {
+  if (!db || !keys) return saving;
+  const snapshot = db, k = keys;
+  saving = saving.then(async () => idb.set('vault', await seal(snapshot, k))).catch(err => {
     console.error(err); toast('⚠️ No se pudo guardar. Exportá un backup.');
   });
+  scheduleSync();
   return saving;
 }
 
@@ -258,6 +292,63 @@ function pickFile(accept) {
   });
 }
 
+/* ---------- Desbloqueo biométrico (Face ID, Touch ID, huella, Windows Hello) ----------
+   Usa una passkey con la extensión PRF de WebAuthn: el sensor del dispositivo devuelve un secreto
+   que solo existe si el dueño se identifica, y con ese secreto se envuelve la clave de datos.
+   Nada biométrico sale del dispositivo ni llega a la app. */
+const bio = {
+  label() {
+    const ua = navigator.userAgent;
+    if (/iPhone|iPad/.test(ua) || (/Macintosh/.test(ua) && 'ontouchend' in document)) return 'Face ID';
+    if (/Macintosh/.test(ua)) return 'Touch ID';
+    if (/Windows/.test(ua)) return 'Windows Hello';
+    return 'huella';
+  },
+  async available() {
+    try { return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); }
+    catch { return false; }
+  },
+  async _prf(credId, salt) {
+    const a = await navigator.credentials.get({
+      publicKey: {
+        challenge: rand(32), rpId: location.hostname, timeout: 60000, userVerification: 'required',
+        allowCredentials: [{ type: 'public-key', id: credId }],
+        extensions: { prf: { eval: { first: salt } } },
+      },
+    });
+    const out = a.getClientExtensionResults()?.prf?.results?.first;
+    if (!out) throw new Error('noprf');
+    return new Uint8Array(out);
+  },
+  async _kek(out) { return importAes(await hkdf(out, 'otra-escena/bio-kek')); },
+  async enable() {
+    const salt = rand(32);
+    const cred = await navigator.credentials.create({
+      publicKey: {
+        rp: { name: 'Otra Escena', id: location.hostname },
+        user: { id: rand(16), name: db.settings.titulo || db.settings.nombre || 'Otra Escena', displayName: db.settings.nombre || 'Otra Escena' },
+        challenge: rand(32),
+        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' },
+        extensions: { prf: { eval: { first: salt } } },
+        timeout: 60000,
+      },
+    });
+    const ext = cred.getClientExtensionResults()?.prf;
+    if (ext && ext.enabled === false) throw new Error('noprf');
+    // Algunos sistemas devuelven el secreto al crear la passkey; otros recién al usarla.
+    const out = ext?.results?.first ? new Uint8Array(ext.results.first) : await this._prf(cred.rawId, salt);
+    const wrapped = await aesEnc(await this._kek(out), keys.raw);
+    await idb.set('bio', { credId: b64(cred.rawId), salt: b64(salt), wrapped, created: new Date().toISOString() });
+  },
+  async unlockRaw() {
+    const b = await idb.get('bio');
+    const out = await this._prf(unb64(b.credId), unb64(b.salt));
+    return aesDec(await this._kek(out), b.wrapped);
+  },
+  disable() { return idb.del('bio'); },
+};
+
 /* ---------- Bloqueo / desbloqueo ---------- */
 async function boot() {
   if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
@@ -311,8 +402,7 @@ function showSetup() {
     const f = new FormData(e.target);
     if (f.get('p1') !== f.get('p2')) { $('#err').textContent = 'Las contraseñas no coinciden.'; return; }
     $('#err').textContent = 'Preparando el cifrado…';
-    kdf = newKdf();
-    key = await deriveKey(f.get('p1'), kdf.salt, kdf.iter);
+    keys = await newKeys(f.get('p1'));
     db = defaultDB(f.get('nombre').trim() || 'Nico', f.get('titulo').trim());
     await persist();
     startSession();
@@ -325,6 +415,7 @@ function showLock(msg = '') {
     <div class="lock-moon">☾</div>
     <h1>Otra Escena</h1>
     <p class="lock-sub">${esc(msg || 'Lo que se dice acá, queda acá.')}</p>
+    <div id="bio-slot"></div>
     <form id="unlock">
       <label class="sr" for="pw">Contraseña</label>
       <input id="pw" type="password" autocomplete="current-password" placeholder="Contraseña" required>
@@ -332,14 +423,21 @@ function showLock(msg = '') {
       <p class="err" id="err"></p>
     </form>
     <div class="lock-quote">“${esc(q.t)}”<cite>${esc(q.a)}</cite></div>`);
-  const pw = $('#pw'); setTimeout(() => pw.focus(), 50);
+  const pw = $('#pw');
+  idb.get('bio').then(b => {
+    if (!b) { setTimeout(() => pw.focus(), 50); return; }
+    $('#bio-slot').innerHTML = `<button class="btn primary bio-btn" type="button" data-act="bio-unlock">Entrar con ${bio.label()}</button>
+      <p class="muted" style="margin:14px 0 10px;color:#9a95a8;font-size:.85rem">o con tu contraseña</p>`;
+    $('#unlock button').classList.replace('primary', 'ghost');
+  });
   $('#unlock').addEventListener('submit', async e => {
     e.preventDefault();
     const btn = $('#unlock button'); btn.disabled = true; $('#err').textContent = 'Abriendo…';
     try {
       const vault = await idb.get('vault');
       const r = await unseal(vault, pw.value);
-      db = migrate(r.data); key = r.key; kdf = vault.kdf;
+      db = migrate(r.data); keys = r.keys;
+      if (!vault.wpw) await persist(); // migra al formato nuevo
       startSession();
     } catch {
       $('#err').textContent = 'Contraseña incorrecta.';
@@ -368,8 +466,9 @@ async function lock(reason = '') {
   const form = $('#sform');
   if (form && formDirty(form)) db.borrador = { ...readSessionForm(form), _id: form.dataset.id || null };
   await persist();
-  db = null; key = null;
+  db = null; keys = null;
   closeModal();
+  closePrintView();
   $$('.confirm-holder').forEach(h => h.remove());
   showLock(reason);
 }
@@ -595,6 +694,7 @@ VIEWS.paciente = {
         <div class="row">
           <button class="btn primary" data-act="new-session" data-patient="${p.id}">+ Sesión</button>
           <button class="btn" data-act="edit-patient" data-id="${p.id}">Editar</button>
+          <button class="btn" data-act="supervision" data-id="${p.id}">Para supervisión</button>
           <button class="btn ghost" data-act="export-history" data-id="${p.id}">Exportar historia</button>
         </div>
       </div>
@@ -777,6 +877,12 @@ VIEWS.ajustes = {
         <div class="row"><button class="btn primary" data-act="export">Exportar backup</button><button class="btn" data-act="import">Restaurar desde backup</button></div>
       </div>
 
+      <div class="section card stack" id="bio-card" hidden>
+        <h3>Desbloqueo rápido</h3>
+        <p class="muted" style="margin:0">Entrá con ${bio.label()} en vez de escribir la contraseña. Se activa por dispositivo: hacelo en cada uno donde uses la app. La contraseña sigue funcionando siempre.</p>
+        <div class="row" id="bio-actions"></div>
+      </div>
+
       <div class="section card stack">
         <h3>Seguridad</h3>
         <p class="muted" style="margin:0">Cifrado AES-256-GCM con clave derivada de tu contraseña (PBKDF2, ${KDF_ITER.toLocaleString('es-AR')} iteraciones). Nada sale de este dispositivo.</p>
@@ -791,6 +897,13 @@ VIEWS.ajustes = {
       </div>`;
   },
   mount(view) {
+    Promise.all([bio.available(), idb.get('bio')]).then(([ok, b]) => {
+      const card = $('#bio-card', view); if (!card || (!ok && !b)) return;
+      card.hidden = false;
+      $('#bio-actions', view).innerHTML = b
+        ? `<span class="badge ok">Activo en este dispositivo</span><button class="btn small ghost" data-act="bio-disable">Desactivar</button>`
+        : `<button class="btn primary" data-act="bio-enable">Activar ${bio.label()}</button>`;
+    });
     $('#settings', view).addEventListener('submit', e => {
       e.preventDefault();
       const f = new FormData(e.target);
@@ -1014,8 +1127,10 @@ async function importBackup({ first = false } = {}) {
         $('#bkerr').textContent = 'Descifrando…';
         try {
           const r = await unseal(vault, e.target.elements.pw.value);
-          if (first) { kdf = vault.kdf; key = r.key; }
+          const local = first ? {} : db._local;
+          if (first) keys = r.keys;
           db = migrate(r.data);
+          db._local = local; // la configuración de sincronización es propia de cada dispositivo
           await persist(); closeModal();
           if (first) startSession(); else render();
           toast('Backup restaurado');
@@ -1043,7 +1158,7 @@ function openChangePass() {
         $('#cperr').textContent = 'Verificando…';
         try { await persist(); await unseal(await idb.get('vault'), f.get('cur')); }
         catch { $('#cperr').textContent = 'La contraseña actual no es correcta.'; return; }
-        kdf = newKdf(); key = await deriveKey(f.get('p1'), kdf.salt, kdf.iter);
+        keys = await rewrapKeys(keys, f.get('p1'));
         await persist(); closeModal();
         toast('Contraseña cambiada. Hacé un backup nuevo.');
       });
@@ -1077,6 +1192,116 @@ function exportHistory(pid) {
   });
 }
 
+/* ---------- Supervisión: caso anonimizado listo para imprimir o guardar en PDF ---------- */
+const isLetter = c => !!c && /[\p{L}\p{N}]/u.test(c);
+function redact(text, rules) {
+  if (!text) return '';
+  const hits = [];
+  for (const r of rules) for (const [a, b] of findRanges(text, r.word)) {
+    if (!isLetter(text[a - 1]) && !isLetter(text[b])) hits.push([a, b, r.repl]);
+  }
+  // Primero las coincidencias más largas ("Lucía Fernández" antes que "Lucía").
+  hits.sort((x, y) => x[0] - y[0] || (y[1] - y[0]) - (x[1] - x[0]));
+  let out = '', pos = 0;
+  for (const [a, b, repl] of hits) { if (a < pos) continue; out += text.slice(pos, a) + repl; pos = b; }
+  return out + text.slice(pos);
+}
+
+function openSupervisionModal(pid) {
+  const p = patientById(pid); if (!p) return;
+  const ss = sessionsOf(pid).filter(s => s.estado === 'realizada' || s.estado === 'ausente').sort(byWhen);
+  if (!ss.length) { toast('Todavía no hay sesiones realizadas para exportar.'); return; }
+  const seud = initialsOf(p).split('').join('. ') + '.';
+  const ocultar = [p.nombre, p.apellido, p.alias].map(x => (x || '').trim()).filter(Boolean).join(', ');
+  const ck = (n, l, on = true) => `<label class="check" style="padding-top:0"><input type="checkbox" name="${n}" ${on ? 'checked' : ''}> ${l}</label>`;
+  openModal(`<form id="supf" class="stack">
+    <header class="modal-head"><h2>Material para supervisión</h2><button type="button" class="icon-btn" data-act="close-modal" aria-label="Cerrar">✕</button></header>
+    <p class="muted" style="margin:0">Arma un documento del caso sin datos identificatorios: el nombre se reemplaza por un seudónimo y no se incluyen teléfono, email ni fecha de nacimiento.</p>
+    <div class="grid2">
+      <label>Seudónimo <input name="seud" value="${esc(seud)}" required></label>
+      <label>Fechas <select name="fechas"><option value="exactas">Mostrar fechas</option><option value="numeradas">Solo numerar las sesiones</option></select></label>
+      <label>Desde <input name="desde" type="date" value="${ss[0].fecha}"></label>
+      <label>Hasta <input name="hasta" type="date" value="${ss[ss.length - 1].fecha}"></label>
+    </div>
+    <label>Palabras a ocultar <textarea name="ocultar" rows="2" placeholder="Separadas por coma">${esc(ocultar)}</textarea>
+      <span class="hint">El nombre del paciente se reemplaza por el seudónimo. Sumá nombres de familiares, parejas, lugares de trabajo, etc.: se reemplazan por [···].</span></label>
+    <div class="grid2">
+      ${ck('motivo', 'Motivo de consulta')}${ck('notasGen', 'Notas generales de la ficha', false)}
+      ${ck('notas', 'Notas de sesión')}${ck('suenos', 'Sueños')}
+      ${ck('lapsus', 'Lapsus y actos fallidos')}${ck('sigs', 'Significantes')}
+      ${ck('ausencias', 'Incluir ausencias')}${ck('analista', 'Mi nombre como analista', false)}
+    </div>
+    <footer class="modal-foot"><span class="spacer"></span><button type="button" class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary">Generar documento</button></footer>
+  </form>`, {
+    mount(m) {
+      $('#supf', m).addEventListener('submit', e => {
+        e.preventDefault();
+        const f = new FormData(e.target), on = n => f.get(n) === 'on';
+        const pseud = String(f.get('seud')).trim() || seud;
+        const own = new Set([p.nombre, p.apellido, p.alias].map(x => norm((x || '').trim())).filter(Boolean));
+        const rules = [{ word: fullName(p), repl: pseud },
+          ...splitSigs(f.get('ocultar')).filter(w => w.length > 1).map(w => ({ word: w, repl: own.has(norm(w)) ? pseud : '[···]' }))];
+        const R = t => esc(redact(t, rules));
+        const numeradas = f.get('fechas') === 'numeradas';
+        const desde = f.get('desde') || '0000', hasta = f.get('hasta') || '9999';
+        const numero = new Map(ss.map((s, i) => [s.id, i + 1]));
+        const incl = ss.filter(s => s.fecha >= desde && s.fecha <= hasta && (on('ausencias') || s.estado === 'realizada'));
+        if (!incl.length) { toast('No hay sesiones en ese período.'); return; }
+        const largo = d => fmtFecha(d, { day: 'numeric', month: 'long', year: 'numeric' });
+        const edad = p.nacimiento ? Math.floor((Date.now() - parseYmd(p.nacimiento)) / (365.25 * 864e5)) : null;
+        const meses = p.inicio ? Math.max(0, Math.round((Date.now() - parseYmd(p.inicio)) / (30.44 * 864e5))) : null;
+        const sigs = [];
+        {
+          const m = new Map();
+          for (const s of incl) for (const g of s.significantes || []) { const k = norm(g); const e = m.get(k) || { label: g, n: 0 }; e.n++; m.set(k, e); }
+          sigs.push(...[...m.values()].sort((a, b) => b.n - a.n));
+        }
+        const meta = [
+          edad != null && `${edad} años`,
+          p.inicio && (numeradas ? `${meses} ${meses === 1 ? 'mes' : 'meses'} de tratamiento` : `En tratamiento desde ${fmtFecha(p.inicio, { month: 'long', year: 'numeric' })}`),
+          p.frecuencia && `Frecuencia: ${esc(p.frecuencia)}`,
+          `${incl.length} ${incl.length === 1 ? 'sesión incluida' : 'sesiones incluidas'}${numeradas ? '' : ` (${largo(incl[0].fecha)} – ${largo(incl[incl.length - 1].fecha)})`}`,
+        ].filter(Boolean);
+        const para = t => t ? `<div class="pd-text">${R(t)}</div>` : '';
+        const html = `
+          <header class="pd-head">
+            <p class="pd-kicker">Material para supervisión · confidencial</p>
+            <h1>Caso ${esc(pseud)}</h1>
+            <p class="pd-meta">${meta.join(' · ')}</p>
+            ${on('analista') ? `<p class="pd-meta">Analista: ${esc(db.settings.titulo || db.settings.nombre)}</p>` : ''}
+          </header>
+          ${on('motivo') && p.motivo ? `<section><h2>Motivo de consulta</h2>${para(p.motivo)}</section>` : ''}
+          ${on('notasGen') && p.notas ? `<section><h2>Notas generales</h2>${para(p.notas)}</section>` : ''}
+          ${on('sigs') && sigs.length ? `<section><h2>Significantes</h2><p class="pd-sigs">${sigs.map(g => `<i>${R(g.label)}</i>${g.n > 1 ? ` <small>×${g.n}</small>` : ''}`).join(' · ')}</p></section>` : ''}
+          <section><h2>Sesiones</h2>
+            ${incl.map(s => `<article class="pd-session">
+              <h3>Sesión ${numero.get(s.id)}${numeradas ? '' : ` · ${largo(s.fecha)}`}${s.estado === 'ausente' ? ' · <span class="pd-aus">ausente</span>' : ''}${s.modalidad === 'online' ? ' · online' : ''}</h3>
+              ${on('notas') ? para(s.notas) : ''}
+              ${on('suenos') && s.suenos ? `<p class="pd-label">Sueño</p>${para(s.suenos)}` : ''}
+              ${on('lapsus') && s.lapsus ? `<p class="pd-label">Lapsus / actos fallidos</p>${para(s.lapsus)}` : ''}
+              ${on('sigs') && s.significantes?.length ? `<p class="pd-sig-line">${s.significantes.map(g => `<i>${R(g)}</i>`).join(', ')}</p>` : ''}
+            </article>`).join('')}
+          </section>
+          <footer class="pd-foot">Documento generado el ${largo(todayStr())}. Los datos identificatorios fueron reemplazados. Revisalo antes de compartirlo: los nombres que no figuren en la lista de palabras a ocultar no se reemplazan.</footer>`;
+        closeModal();
+        showPrintView(html);
+      });
+    },
+  });
+}
+
+function showPrintView(html) {
+  closePrintView();
+  const root = document.createElement('div');
+  root.id = 'print-root';
+  root.innerHTML = `<div class="print-bar"><button class="btn" data-act="print-close">‹ Volver</button><span class="spacer"></span>
+    <button class="btn primary" data-act="print-go">Imprimir o guardar PDF</button></div><article class="print-doc">${html}</article>`;
+  document.body.appendChild(root);
+  document.body.classList.add('printing');
+  window.scrollTo(0, 0);
+}
+function closePrintView() { $('#print-root')?.remove(); document.body.classList.remove('printing'); }
+
 /* ---------- Acciones (delegación de eventos) ---------- */
 document.addEventListener('click', async e => {
   const t = e.target.closest('[data-act]'); if (!t) return;
@@ -1085,6 +1310,29 @@ document.addEventListener('click', async e => {
     case 'setup': return showSetup();
     case 'restore-first': return importBackup({ first: true });
     case 'lock': return lock();
+    case 'bio-unlock': {
+      const err = $('#err');
+      try {
+        err.textContent = '';
+        const raw = await bio.unlockRaw();
+        const r = await openWithRaw(await idb.get('vault'), raw);
+        db = migrate(r.data); keys = r.keys;
+        startSession();
+      } catch (ex) {
+        err.textContent = ex?.name === 'NotAllowedError' ? 'Cancelado. Podés entrar con tu contraseña.' : 'No se pudo usar ' + bio.label() + '. Entrá con tu contraseña.';
+      }
+      return;
+    }
+    case 'bio-enable': {
+      try {
+        await bio.enable(); toast(bio.label() + ' activado'); render();
+      } catch (ex) {
+        toast(ex?.message === 'noprf' ? 'Este dispositivo o navegador no permite desbloqueo biométrico para apps web.'
+          : ex?.name === 'NotAllowedError' ? 'Cancelado' : 'No se pudo activar ' + bio.label());
+      }
+      return;
+    }
+    case 'bio-disable': await bio.disable(); toast(bio.label() + ' desactivado en este dispositivo'); render(); return;
     case 'close-modal': return requestCloseModal();
     case 'new-session': return openSessionModal({ fecha: t.dataset.fecha, patientId: t.dataset.patient });
     case 'edit-session': return openSessionModal({ id });
@@ -1111,6 +1359,9 @@ document.addEventListener('click', async e => {
       save(); closeModal(); location.hash = '#/pacientes'; toast('Paciente eliminado'); return;
     }
     case 'export-history': return exportHistory(id);
+    case 'supervision': return openSupervisionModal(id);
+    case 'print-go': return window.print();
+    case 'print-close': return closePrintView();
     case 'export': return exportBackup();
     case 'import': return importBackup();
     case 'change-pass': return openChangePass();
