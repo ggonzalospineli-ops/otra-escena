@@ -1,5 +1,5 @@
 // Service worker: hace que la app funcione sin conexión.
-const CACHE = 'otra-escena-v3';
+const CACHE = 'otra-escena-v4';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/icon-maskable.png'];
 
@@ -10,7 +10,8 @@ self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
-// Sirve desde caché y actualiza en segundo plano (stale-while-revalidate).
+// Archivos de la app: primero la red (siempre la versión más nueva) y, sin conexión, la copia guardada.
+// Tipografías: primero la copia guardada, porque no cambian.
 self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
@@ -18,11 +19,19 @@ self.addEventListener('fetch', e => {
   const isFont = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
   if (url.origin !== location.origin && !isFont) return;
   e.respondWith(caches.open(CACHE).then(async cache => {
-    const cached = await cache.match(req, { ignoreSearch: url.origin === location.origin });
-    const net = fetch(req).then(res => {
+    if (isFont) {
+      const cached = await cache.match(req);
+      if (cached) return cached;
+      const res = await fetch(req);
       if (res.ok || res.type === 'opaque') cache.put(req, res.clone());
       return res;
-    }).catch(() => cached);
-    return cached || net;
+    }
+    try {
+      const res = await fetch(req, { cache: 'no-cache' });
+      if (res.ok) cache.put(req, res.clone());
+      return res;
+    } catch {
+      return (await cache.match(req, { ignoreSearch: true })) || cache.match('./index.html');
+    }
   }));
 });
