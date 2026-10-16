@@ -1,0 +1,28 @@
+// Service worker: hace que la app funcione sin conexión.
+const CACHE = 'otra-escena-v1';
+const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
+  './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/icon-maskable.png'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    .then(() => self.clients.claim()));
+});
+// Sirve desde caché y actualiza en segundo plano (stale-while-revalidate).
+self.addEventListener('fetch', e => {
+  const req = e.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  const isFont = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
+  if (url.origin !== location.origin && !isFont) return;
+  e.respondWith(caches.open(CACHE).then(async cache => {
+    const cached = await cache.match(req, { ignoreSearch: url.origin === location.origin });
+    const net = fetch(req).then(res => {
+      if (res.ok || res.type === 'opaque') cache.put(req, res.clone());
+      return res;
+    }).catch(() => cached);
+    return cached || net;
+  }));
+});
