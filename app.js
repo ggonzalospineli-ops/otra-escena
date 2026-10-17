@@ -189,16 +189,15 @@ function migrate(d) {
   return d;
 }
 
-function scheduleSync() { /* la sincronización entre dispositivos todavía no está activa */ }
 function save() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 250); }
-function persist() {
+function persist(opts = {}) {
   clearTimeout(saveTimer);
   if (!db || !keys) return saving;
   const snapshot = db, k = keys;
   saving = saving.then(async () => idb.set('vault', await seal(snapshot, k))).catch(err => {
     console.error(err); toast('⚠️ No se pudo guardar. Exportá un backup.');
   });
-  scheduleSync();
+  if (!opts.quiet) scheduleSync();
   return saving;
 }
 
@@ -244,7 +243,10 @@ function openModal(html, { narrow = false, mount, guard } = {}) {
   if (first && !('ontouchstart' in window)) first.focus();
   return m;
 }
-function closeModal() { $('#modal-root').innerHTML = ''; modalGuard = null; }
+function closeModal() {
+  $('#modal-root').innerHTML = ''; modalGuard = null;
+  if (syncPendingRender && db) { syncPendingRender = false; render(); }
+}
 async function requestCloseModal() {
   if (modalGuard && modalGuard() && !(await confirmDialog('Hay cambios sin guardar. ¿Descartarlos?', 'Descartar'))) return;
   closeModal();
@@ -291,6 +293,248 @@ function pickFile(accept) {
     i.onchange = () => resolve(i.files[0] || null); i.click();
   });
 }
+
+/* ---------- Sincronización entre dispositivos (cifrado de punta a punta) ----------
+   Cada paciente, sesión y los ajustes viajan como registros cifrados con la clave de datos.
+   El servidor solo ve blobs ilegibles. Para sumar un dispositivo hace falta el código de
+   vinculación y la contraseña. Si dos dispositivos editan lo mismo, gana el cambio más reciente. */
+const SYNC_URL = 'https://otra-escena-sync.tra-scena-ync.workers.dev';
+const SYNC_SETTINGS = ['nombre', 'titulo', 'moneda', 'honorario', 'duracion'];
+let syncTimer = null, syncRunning = null, syncAgain = false, syncPendingRender = false;
+let syncStatus = { state: 'idle', error: null };
+let pendingJoin = null;
+
+function cyrb53(str) {
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) { const ch = str.charCodeAt(i); h1 = Math.imul(h1 ^ ch, 2654435761); h2 = Math.imul(h2 ^ ch, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+const hashData = d => cyrb53(JSON.stringify(d, (k, v) => (k === '_u' ? undefined : v)));
+function pickSettings(D) { const o = {}; for (const k of SYNC_SETTINGS) o[k] = D.settings[k]; return o; }
+function findLocal(D, id) {
+  if (id === 'settings') return { kind: 'settings', data: pickSettings(D), u: D.settings._u || 0 };
+  let o = D.patients.find(x => x.id === id); if (o) return { kind: 'patient', data: o, u: o._u || 0 };
+  o = D.sessions.find(x => x.id === id); if (o) return { kind: 'session', data: o, u: o._u || 0 };
+  return null;
+}
+function localRecords(D) {
+  const m = new Map([['settings', findLocal(D, 'settings')]]);
+  for (const p of D.patients) m.set(p.id, { kind: 'patient', data: p, u: p._u || 0 });
+  for (const s of D.sessions) m.set(s.id, { kind: 'session', data: s, u: s._u || 0 });
+  return m;
+}
+function stamp(D, id, u) {
+  if (id === 'settings') { D.settings._u = u; return; }
+  const o = D.patients.find(x => x.id === id) || D.sessions.find(x => x.id === id);
+  if (o) o._u = u;
+}
+
+function applyRemote(D, st, rem) {
+  const loc = findLocal(D, rem.id);
+  const locDirty = loc && st.hashes[rem.id] !== hashData(loc.data);
+  if (rem.kind === 'tomb') {
+    if (!loc) { st.hashes[rem.id] = 'x'; return false; }
+    if (locDirty && loc.u > rem.u) return false;
+    D.patients = D.patients.filter(x => x.id !== rem.id);
+    D.sessions = D.sessions.filter(x => x.id !== rem.id);
+    st.hashes[rem.id] = 'x';
+    return true;
+  }
+  const h = hashData(rem.data);
+  if (loc && hashData(loc.data) === h) { st.hashes[rem.id] = h; return false; }
+  if (loc && locDirty && loc.u > rem.u) return false;           // mi cambio es más nuevo
+  if (!loc && st.tombs[rem.id] && st.tombs[rem.id] > rem.u) return false; // lo borré acá después
+  delete st.tombs[rem.id];
+  if (rem.kind === 'settings') Object.assign(D.settings, rem.data, { _u: rem.u });
+  else {
+    const arr = rem.kind === 'patient' ? D.patients : D.sessions;
+    const cur = arr.find(x => x.id === rem.id);
+    // Se actualiza el mismo objeto para no romper referencias de lo que esté abierto en pantalla.
+    if (cur) { for (const k of Object.keys(cur)) delete cur[k]; Object.assign(cur, rem.data, { _u: rem.u }); }
+    else arr.push({ ...rem.data, _u: rem.u });
+  }
+  st.hashes[rem.id] = h;
+  return true;
+}
+
+async function syncToken(k) { return b64u(await hkdf(k.raw, 'otra-escena/sync-token')); }
+const syncMeta = k => JSON.stringify({ kdf: k.kdf, wpw: k.wpw });
+async function syncApi(path, { method = 'GET', token, body } = {}) {
+  const headers = {};
+  if (token) headers.Authorization = 'Bearer ' + token;
+  if (body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(SYNC_URL + path, { method, headers, body: body ? JSON.stringify(body) : undefined, cache: 'no-store' });
+  if (!r.ok) { const e = new Error('http ' + r.status); e.status = r.status; throw e; }
+  return r.json();
+}
+
+function setSyncStatus(state, error = null) {
+  syncStatus = { state, error };
+  const el = $('#sync-status'); if (el) el.innerHTML = syncStatusHTML();
+}
+function syncStatusHTML() {
+  const st = db?._local?.sync; if (!st) return '';
+  if (syncStatus.state === 'syncing') return '<span class="badge info">Sincronizando…</span>';
+  if (syncStatus.state === 'error') {
+    const e = syncStatus.error;
+    const msg = !navigator.onLine ? 'Sin conexión: se sincroniza cuando vuelva internet' : e?.status === 404 ? 'El espacio ya no existe en el servidor' : e?.status === 401 ? 'Este dispositivo ya no tiene acceso' : 'No se pudo sincronizar, se reintenta solo';
+    return `<span class="badge warn">${msg}</span>`;
+  }
+  return st.lastSync ? `<span class="badge ok">Sincronizado · ${new Date(st.lastSync).toLocaleString('es-AR', { dateStyle: 'short', timeStyle: 'short' })}</span>` : '';
+}
+
+function scheduleSync(delay = 2500) {
+  if (!db?._local?.sync) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(), delay);
+}
+
+function syncNow({ full = false } = {}) {
+  const D = db, K = keys, st = D?._local?.sync;
+  if (!st || !K) return Promise.resolve();
+  if (!navigator.onLine) { setSyncStatus('error'); return Promise.resolve(); }
+  if (syncRunning) { syncAgain = true; return syncRunning; }
+  syncRunning = (async () => {
+    setSyncStatus('syncing');
+    st.hashes ||= {}; st.tombs ||= {};
+    const token = await syncToken(K);
+    const now = Date.now();
+    // 1. Marcar lo que cambió acá desde la última vez, y lo que se borró.
+    let recs = localRecords(D);
+    for (const [id, r] of recs) if (st.hashes[id] !== hashData(r.data)) stamp(D, id, now);
+    for (const id of Object.keys(st.hashes)) if (!recs.has(id) && st.hashes[id] !== 'x' && !st.tombs[id]) st.tombs[id] = now;
+    // 2. Bajar los cambios de los otros dispositivos.
+    let since = full ? 0 : (st.lastSeq || 0), changed = false, metaVer = st.metaVer || 1;
+    for (;;) {
+      const res = await syncApi(`/space/${st.space}/pull?since=${since}`, { token });
+      metaVer = res.metaVer;
+      for (const row of res.records) {
+        since = Math.max(since, row.seq);
+        let rem;
+        try { rem = JSON.parse(td.decode(await aesDec(K.aes, JSON.parse(row.blob)))); } catch { continue; }
+        if (applyRemote(D, st, rem)) changed = true;
+      }
+      if (!res.more) break;
+    }
+    st.lastSeq = Math.max(st.lastSeq || 0, since);
+    // 3. Si la contraseña se cambió en otro dispositivo, adoptarla también acá.
+    if (metaVer > (st.metaVer || 1)) {
+      const { meta } = await syncApi(`/space/${st.space}/meta`);
+      const m = JSON.parse(meta);
+      K.kdf = m.kdf; K.wpw = m.wpw;
+      st.metaVer = metaVer;
+    }
+    // 4. Subir lo propio.
+    recs = localRecords(D);
+    const out = [];
+    for (const [id, r] of recs) { const h = hashData(r.data); if (st.hashes[id] !== h) out.push({ id, h, rem: { kind: r.kind, id, u: r.u || now, data: r.data } }); }
+    for (const [id, u] of Object.entries(st.tombs)) out.push({ id, h: 'x', rem: { kind: 'tomb', id, u } });
+    for (let i = 0; i < out.length; i += 100) {
+      const chunk = out.slice(i, i + 100), records = [];
+      for (const o of chunk) records.push({ rid: o.id, blob: JSON.stringify(await aesEnc(K.aes, te.encode(JSON.stringify(o.rem)))) });
+      await syncApi(`/space/${st.space}/push`, { method: 'POST', token, body: { records } });
+      for (const o of chunk) { st.hashes[o.id] = o.h; if (o.h === 'x') delete st.tombs[o.id]; }
+    }
+    st.lastSync = new Date().toISOString();
+    if (db === D) {
+      await persist({ quiet: true });
+      if (changed) { if ($('#modal-root').innerHTML || $('#print-root')) syncPendingRender = true; else render(); }
+    }
+    setSyncStatus('ok');
+  })().catch(e => { console.warn('sync', e); setSyncStatus('error', e); })
+    .finally(() => { syncRunning = null; if (syncAgain) { syncAgain = false; scheduleSync(500); } });
+  return syncRunning;
+}
+
+async function syncEnable() {
+  const space = b64u(rand(16));
+  await syncApi(`/space/${space}`, { method: 'POST', body: { token: await syncToken(keys), meta: syncMeta(keys) } });
+  db._local.sync = { space, lastSeq: 0, metaVer: 1, hashes: {}, tombs: {} };
+  await persist({ quiet: true });
+  await syncNow();
+}
+async function syncPushMeta() {
+  const st = db._local.sync;
+  await syncApi(`/space/${st.space}/meta`, { method: 'PUT', token: await syncToken(keys), body: { meta: syncMeta(keys) } });
+}
+// Valida el código y la contraseña contra el servidor y devuelve las claves compartidas.
+async function syncFetchKeys(code, pass) {
+  const space = (String(code).match(/[A-Za-z0-9_-]{22,64}/) || [])[0];
+  if (!space) throw new Error('code');
+  let meta, metaVer;
+  try { ({ meta, metaVer } = await syncApi(`/space/${space}/meta`)); }
+  catch (e) { throw new Error(e.status === 404 ? 'code' : 'net'); }
+  const m = JSON.parse(meta);
+  let raw;
+  try { raw = await aesDec(await deriveKey(pass, m.kdf.salt, m.kdf.iter), m.wpw); }
+  catch { throw new Error('pass'); }
+  return { space, metaVer, keys: await keysFromRaw(raw, m.kdf, m.wpw) };
+}
+// Vincula este dispositivo: adopta la clave y la contraseña compartidas y suma lo que ya hubiera acá.
+async function syncJoin(code, pass) {
+  const r = await syncFetchKeys(code, pass);
+  if (!db) db = defaultDB('', '');
+  keys = r.keys;
+  // Los ajustes del otro dispositivo tienen prioridad sobre los de este.
+  db.settings._u = 0;
+  db._local.sync = { space: r.space, lastSeq: 0, metaVer: r.metaVer, hashes: { settings: hashData(pickSettings(db)) }, tombs: {} };
+  await idb.del('bio'); // la clave cambió: hay que volver a activar Face ID en este dispositivo
+  await persist({ quiet: true });
+  await syncNow({ full: true });
+}
+function syncLink() { return `${location.origin}${location.pathname}#vincular=${db._local.sync.space}`; }
+function syncErrorText(e) {
+  return e?.message === 'code' ? 'Ese código no existe. Revisalo en el otro dispositivo (Ajustes → Sincronización).'
+    : e?.message === 'pass' ? 'La contraseña no coincide con la del otro dispositivo.'
+      : 'No hay conexión con el servidor. Probá de nuevo en un rato.';
+}
+
+function openJoinModal(code = '') {
+  openModal(`<form id="joinf" class="stack">
+    <header class="modal-head"><h2>Vincular con otro dispositivo</h2><button type="button" class="icon-btn" data-act="close-modal" aria-label="Cerrar">✕</button></header>
+    <p class="muted" style="margin:0">En el dispositivo donde ya usás la app, andá a Ajustes → Sincronización y copiá el código o el enlace.</p>
+    <label>Código de vinculación <input name="code" value="${esc(code)}" required autocomplete="off" spellcheck="false"></label>
+    <label>Contraseña de ese dispositivo <input name="pw" type="password" required autocomplete="current-password"></label>
+    ${db && (db.patients.length || db.sessions.length) ? '<div class="banner" style="margin:0"><p>Lo que ya tenés en este dispositivo se suma a lo del otro. Desde ahora, acá también vas a entrar con la contraseña del otro dispositivo.</p></div>' : ''}
+    <p class="err" id="joinerr"></p>
+    <footer class="modal-foot"><span class="spacer"></span><button type="button" class="btn ghost" data-act="close-modal">Cancelar</button><button class="btn primary">Vincular</button></footer>
+  </form>`, {
+    narrow: true,
+    mount(m) {
+      $('#joinf', m).addEventListener('submit', async e => {
+        e.preventDefault();
+        const f = e.target; $('#joinerr').textContent = 'Vinculando…';
+        try { await syncJoin(f.code.value, f.pw.value); closeModal(); render(); toast('Dispositivo vinculado'); }
+        catch (ex) { $('#joinerr').textContent = syncErrorText(ex); }
+      });
+    },
+  });
+}
+
+function showJoinFirst(code = '') {
+  lockShell(`
+    <h1>Otra Escena</h1>
+    <p class="lock-sub">Sumá este dispositivo a tu consultorio.</p>
+    <form id="joinfirst">
+      <p style="margin:0 0 4px;color:#c9c1b0;font-size:.9rem">En el dispositivo donde ya usás la app: Ajustes → Sincronización → copiá el código o el enlace.</p>
+      <label>Código de vinculación <input name="code" value="${esc(code)}" required autocomplete="off" spellcheck="false"></label>
+      <label>Tu contraseña <input name="pw" type="password" required autocomplete="current-password"></label>
+      <button class="btn primary">Vincular y descargar</button>
+      <p class="err" id="err"></p>
+      <button type="button" class="btn ghost" data-act="welcome">Volver</button>
+    </form>`);
+  $('#joinfirst').addEventListener('submit', async e => {
+    e.preventDefault();
+    const f = e.target, btn = $('button.primary', f);
+    btn.disabled = true; $('#err').textContent = 'Descargando tu consultorio…';
+    try { db = null; await syncJoin(f.code.value, f.pw.value); startSession(); toast('¡Listo! Este dispositivo ya está sincronizado.'); }
+    catch (ex) { db = null; keys = null; $('#err').textContent = syncErrorText(ex); btn.disabled = false; }
+  });
+}
+
+addEventListener('online', () => scheduleSync(500));
+setInterval(() => { if (db?._local?.sync && document.visibilityState === 'visible') syncNow(); }, 60000);
 
 /* ---------- Desbloqueo biométrico (Face ID, Touch ID, huella, Windows Hello) ----------
    Usa una passkey con la extensión PRF de WebAuthn: el sensor del dispositivo devuelve un secreto
@@ -359,10 +603,12 @@ async function boot() {
     $('#app').innerHTML = `<div class="lock"><div class="lock-card"><h1>Otra Escena</h1><p class="lock-sub">Este navegador no permite el cifrado necesario. Abrí la app desde su dirección https.</p></div></div>`;
     return;
   }
+  const m = location.hash.match(/^#vincular=([A-Za-z0-9_-]{22,64})/);
+  if (m) { pendingJoin = m[1]; history.replaceState(null, '', location.pathname); }
   let vault = null;
   try { vault = await idb.get('vault'); }
   catch { lockShell(`<h1>Otra Escena</h1><p class="lock-sub">No se puede acceder al almacenamiento. Si estás en modo incógnito, abrí la app en una ventana normal.</p>`); return; }
-  vault ? showLock() : showWelcome();
+  vault ? showLock() : pendingJoin ? showJoinFirst(pendingJoin) : showWelcome();
 }
 
 function lockShell(inner) {
@@ -377,6 +623,7 @@ function showWelcome() {
     <div class="dedicatoria-firma">— ${esc(DEDICATORIA.firma)}</div>
     <div style="margin-top:34px;display:flex;flex-direction:column;gap:10px">
       <button class="btn primary" data-act="setup">Empezar</button>
+      <button class="btn ghost" data-act="join-first">Ya la uso en otro dispositivo</button>
     </div>`);
 }
 
@@ -459,6 +706,11 @@ function startSession() {
       <main id="view" tabindex="-1"></main>
     </div>`;
   if (!location.hash) location.hash = '#/inicio'; else render();
+  if (db._local.sync) syncNow({ full: true });
+  if (pendingJoin) {
+    const code = pendingJoin; pendingJoin = null;
+    if (db._local.sync?.space !== code) openJoinModal(code);
+  }
 }
 
 async function lock(reason = '') {
@@ -481,6 +733,7 @@ setInterval(() => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') persist();
   else if (db && db.settings.autolock > 0 && Date.now() - lastActivity > db.settings.autolock * 60000) lock('Se bloqueó por inactividad.');
+  else scheduleSync(300);
 });
 addEventListener('pagehide', () => persist());
 
@@ -871,8 +1124,22 @@ VIEWS.ajustes = {
       </form>
 
       <div class="section card stack">
+        <h3>Sincronización</h3>
+        ${db._local.sync ? `
+          <p class="muted" style="margin:0">Este dispositivo comparte los datos con tus otros dispositivos. Todo viaja cifrado: el servidor no puede leer nada.</p>
+          <div id="sync-status">${syncStatusHTML()}</div>
+          <label>Código de vinculación <input readonly value="${esc(db._local.sync.space)}" style="font-family:ui-monospace,Consolas,monospace"></label>
+          <p class="hint" style="margin:-6px 0 0">Para sumar otro dispositivo: abrí el enlace en él e ingresá tu contraseña. Compartilo solo con vos mismo.</p>
+          <div class="row"><button class="btn primary" data-act="sync-share">Enviar enlace a otro dispositivo</button><button class="btn" data-act="sync-now">Sincronizar ahora</button></div>
+          <div class="row"><button class="btn small ghost" data-act="sync-unlink">Desvincular este dispositivo</button><button class="btn small ghost danger" data-act="sync-delete">Borrar datos del servidor</button></div>`
+        : `
+          <p class="muted" style="margin:0">Usá la app en el iPhone, la Mac y la tablet con los mismos datos. Todo se cifra en el dispositivo antes de salir: el servidor solo guarda datos ilegibles. Para sumar un dispositivo vas a necesitar un código y tu contraseña.</p>
+          <div class="row"><button class="btn primary" data-act="sync-enable">Activar sincronización</button><button class="btn" data-act="sync-join">Vincular con otro dispositivo</button></div>`}
+      </div>
+
+      <div class="section card stack">
         <h3>Backup</h3>
-        <p class="muted" style="margin:0">Los datos viven solo en este dispositivo. El backup es un archivo cifrado con tu contraseña: guardalo en iCloud, Drive o un pendrive. Sirve también para pasar todo a otro dispositivo.</p>
+        <p class="muted" style="margin:0">${db._local.sync ? 'Aunque sincronices, conviene tener una copia propia.' : 'Los datos viven solo en este dispositivo.'} El backup es un archivo cifrado con tu contraseña: guardalo en iCloud, Drive o un pendrive.</p>
         <p style="margin:0">Último backup: <b>${lb}</b></p>
         <div class="row"><button class="btn primary" data-act="export">Exportar backup</button><button class="btn" data-act="import">Restaurar desde backup</button></div>
       </div>
@@ -1160,7 +1427,10 @@ function openChangePass() {
         catch { $('#cperr').textContent = 'La contraseña actual no es correcta.'; return; }
         keys = await rewrapKeys(keys, f.get('p1'));
         await persist(); closeModal();
-        toast('Contraseña cambiada. Hacé un backup nuevo.');
+        if (db._local.sync) {
+          try { await syncPushMeta(); toast('Contraseña cambiada en todos tus dispositivos.'); }
+          catch { toast('La contraseña cambió acá, pero no se pudo avisar a los otros dispositivos. Reintentá con conexión.'); }
+        } else toast('Contraseña cambiada. Hacé un backup nuevo.');
       });
     },
   });
@@ -1308,6 +1578,33 @@ document.addEventListener('click', async e => {
   const { act, id } = t.dataset;
   switch (act) {
     case 'setup': return showSetup();
+    case 'join-first': return showJoinFirst(pendingJoin || '');
+    case 'welcome': return showWelcome();
+    case 'sync-enable': {
+      t.disabled = true; t.textContent = 'Activando…';
+      try { await syncEnable(); toast('Sincronización activada'); }
+      catch { toast('No se pudo conectar con el servidor. Probá de nuevo.'); }
+      render(); return;
+    }
+    case 'sync-join': return openJoinModal();
+    case 'sync-now': await syncNow(); return;
+    case 'sync-share': {
+      const url = syncLink();
+      if (navigator.share && 'ontouchstart' in window) { try { await navigator.share({ title: 'Otra Escena', text: 'Abrí este enlace en tu otro dispositivo', url }); } catch { } return; }
+      try { await navigator.clipboard.writeText(url); toast('Enlace copiado. Abrilo en tu otro dispositivo.'); }
+      catch { toast('Copiá el código de vinculación a mano.'); }
+      return;
+    }
+    case 'sync-unlink': {
+      if (!(await confirmDialog('Este dispositivo deja de sincronizar. Los datos quedan acá y en tus otros dispositivos.', 'Desvincular', false))) return;
+      db._local.sync = null; await persist({ quiet: true }); render(); toast('Dispositivo desvinculado'); return;
+    }
+    case 'sync-delete': {
+      if (!(await confirmDialog('Se borran los datos cifrados del servidor y se apaga la sincronización en todos los dispositivos. Los datos locales de cada dispositivo no se tocan.', 'Borrar del servidor'))) return;
+      try { await syncApi(`/space/${db._local.sync.space}`, { method: 'DELETE', token: await syncToken(keys) }); }
+      catch (e) { if (e.status !== 404) { toast('No se pudo conectar con el servidor.'); return; } }
+      db._local.sync = null; await persist({ quiet: true }); render(); toast('Datos borrados del servidor'); return;
+    }
     case 'restore-first': return importBackup({ first: true });
     case 'lock': return lock();
     case 'bio-unlock': {
