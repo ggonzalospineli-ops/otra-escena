@@ -74,6 +74,7 @@ const norm = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLow
 const byWhen = (a, b) => (a.fecha + (a.hora || '')).localeCompare(b.fecha + (b.hora || ''));
 const byName = (a, b) => fullName(a).localeCompare(fullName(b), 'es');
 const todayStr = () => ymd(new Date());
+const safeUrl = u => (/^https?:\/\//i.test(String(u || '').trim()) ? String(u).trim() : '#');
 
 function money(n) {
   try {
@@ -422,8 +423,11 @@ function syncNow({ full = false } = {}) {
       if (!res.more) break;
     }
     st.lastSeq = Math.max(st.lastSeq || 0, since);
-    // 3. Si la contraseña se cambió en otro dispositivo, adoptarla también acá.
-    if (metaVer > (st.metaVer || 1)) {
+    // 3. Contraseña: si se cambió acá sin conexión, avisar; si se cambió en otro dispositivo, adoptarla.
+    if (st.metaDirty) {
+      await syncApi(`/space/${st.space}/meta`, { method: 'PUT', token, body: { meta: syncMeta(K) } });
+      st.metaDirty = false; st.metaVer = metaVer + 1;
+    } else if (metaVer > (st.metaVer || 1)) {
       const { meta } = await syncApi(`/space/${st.space}/meta`);
       const m = JSON.parse(meta);
       K.kdf = m.kdf; K.wpw = m.wpw;
@@ -533,7 +537,7 @@ function showJoinFirst(code = '') {
     e.preventDefault();
     const f = e.target, btn = $('button.primary', f);
     btn.disabled = true; $('#err').textContent = 'Descargando tu consultorio…';
-    try { db = null; await syncJoin(f.code.value, f.pw.value); startSession(); toast('¡Listo! Este dispositivo ya está sincronizado.'); }
+    try { db = null; await syncJoin(f.code.value, f.pw.value); startSession(); toast('¡Listo! Este dispositivo ya está sincronizado.'); openGuide(); }
     catch (ex) { db = null; keys = null; $('#err').textContent = syncErrorText(ex); btn.disabled = false; }
   });
 }
@@ -586,9 +590,22 @@ const bio = {
     const ext = cred.getClientExtensionResults()?.prf;
     if (ext && ext.enabled === false) throw new Error('noprf');
     // Algunos sistemas devuelven el secreto al crear la passkey; otros recién al usarla.
-    const out = ext?.results?.first ? new Uint8Array(ext.results.first) : await this._prf(cred.rawId, salt);
+    if (ext?.results?.first) return this._store(cred.rawId, salt, new Uint8Array(ext.results.first));
+    try { return this._store(cred.rawId, salt, await this._prf(cred.rawId, salt)); }
+    catch (e) {
+      if (e?.name !== 'NotAllowedError') throw e;
+      this._pending = { credId: cred.rawId, salt }; // hace falta que la persona toque de nuevo
+      throw new Error('confirm');
+    }
+  },
+  async confirm() {
+    const pd = this._pending; this._pending = null;
+    if (!pd) throw new Error('noprf');
+    return this._store(pd.credId, pd.salt, await this._prf(pd.credId, pd.salt));
+  },
+  async _store(credId, salt, out) {
     const wrapped = await aesEnc(await this._kek(out), keys.raw);
-    await idb.set('bio', { credId: b64(cred.rawId), salt: b64(salt), wrapped, created: new Date().toISOString() });
+    await idb.set('bio', { credId: b64(credId), salt: b64(salt), wrapped, created: new Date().toISOString() });
   },
   async unlockRaw() {
     const b = await idb.get('bio');
@@ -597,6 +614,18 @@ const bio = {
   },
   disable() { return idb.del('bio'); },
 };
+
+function bioError(ex) {
+  if (ex?.message === 'confirm') {
+    openModal(`<div class="guide"><div class="guide-icon">◉</div><h2>Un paso más</h2>
+      <p>Confirmá con ${bio.label()} una vez más para terminar de activarlo.</p>
+      <footer class="modal-foot"><button class="btn ghost" data-act="close-modal">Ahora no</button><span class="spacer"></span>
+      <button class="btn primary" data-act="bio-confirm">Confirmar con ${bio.label()}</button></footer></div>`, { narrow: true });
+    return;
+  }
+  toast(ex?.message === 'noprf' ? 'Este dispositivo o navegador no permite desbloqueo biométrico para apps web. Podés seguir con la contraseña.'
+    : ex?.name === 'NotAllowedError' ? 'Cancelado' : 'No se pudo activar ' + bio.label() + '. Podés probar después en Ajustes.');
+}
 
 /* ---------- Bloqueo / desbloqueo ---------- */
 async function boot() {
@@ -761,7 +790,15 @@ function render() {
   const full = location.hash;
   if (full.split('?')[0] !== lastRoute) { window.scrollTo(0, 0); lastRoute = full.split('?')[0]; }
 }
-addEventListener('hashchange', render);
+addEventListener('hashchange', () => {
+  const m = location.hash.match(/^#vincular=([A-Za-z0-9_-]{22,64})/);
+  if (m) {
+    history.replaceState(null, '', location.pathname + '#/ajustes');
+    if (db && db._local.sync?.space !== m[1]) { render(); openJoinModal(m[1]); return; }
+    if (!db) pendingJoin = m[1];
+  }
+  render();
+});
 
 /* ---------- Componentes ---------- */
 function sessionBadges(s, { withEstado = true } = {}) {
@@ -775,7 +812,7 @@ function sessionRow(s, { showPatient = true, showDate = false, snippet = false, 
   const p = patientById(s.patientId);
   const title = showPatient ? displayName(p) : fmtFecha(s.fecha, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
   const acts = [];
-  if (actions && s.estado === 'programada' && s.modalidad === 'online' && s.link && s.fecha >= todayStr()) acts.push(`<a class="btn small" href="${esc(s.link)}" target="_blank" rel="noopener">Entrar</a>`);
+  if (actions && s.estado === 'programada' && s.modalidad === 'online' && s.link && s.fecha >= todayStr()) acts.push(`<a class="btn small" href="${esc(safeUrl(s.link))}" target="_blank" rel="noopener">Entrar</a>`);
   if (actions && s.estado === 'programada' && s.fecha <= todayStr()) acts.push(`<button class="btn small" data-act="mark-done" data-id="${s.id}">✓ Realizada</button>`);
   if (actions && isPendiente(s)) acts.push(`<button class="btn small" data-act="cobrar" data-id="${s.id}">Cobrar</button>`);
   const snip = snippet && (s.notas || s.suenos) ? `<span class="srow-snip">${esc((s.notas || s.suenos).slice(0, 220))}</span>`
@@ -975,7 +1012,7 @@ VIEWS.paciente = {
         ${field('Frecuencia', esc(p.frecuencia))}
         ${field('Honorario por sesión', p.honorario ? money(p.honorario) : '')}
         ${field('Derivación', esc(p.derivacion))}
-        ${field('Link de videollamada', p.link ? `<a href="${esc(p.link)}" target="_blank" rel="noopener">${esc(p.link)}</a>` : '', 'full')}
+        ${field('Link de videollamada', p.link ? `<a href="${esc(safeUrl(p.link))}" target="_blank" rel="noopener">${esc(p.link)}</a>` : '', 'full')}
         ${field('Motivo de consulta', esc(p.motivo), 'full')}
         ${field('Notas generales', esc(p.notas), 'full')}
         ${!(p.alias || edad != null || p.telefono || p.email || p.motivo || p.notas || p.frecuencia) ? '<p class="muted full" style="margin:0">Sin datos de ficha todavía. Tocá “Editar” para completarla.</p>' : ''}
@@ -1541,7 +1578,10 @@ function openChangePass() {
         await persist(); closeModal();
         if (db._local.sync) {
           try { await syncPushMeta(); toast('Contraseña cambiada en todos tus dispositivos.'); }
-          catch { toast('La contraseña cambió acá, pero no se pudo avisar a los otros dispositivos. Reintentá con conexión.'); }
+          catch {
+            db._local.sync.metaDirty = true; save();
+            toast('Contraseña cambiada. Los otros dispositivos se enteran cuando haya conexión.');
+          }
         } else toast('Contraseña cambiada. Hacé un backup nuevo.');
       });
     },
@@ -1761,7 +1801,7 @@ document.addEventListener('click', async e => {
     case 'guia-fin': db.settings.guiaVista = true; save(); closeModal(); return;
     case 'guia-bio': {
       try { await bio.enable(); toast(bio.label() + ' activado'); guideGo(guideStep); }
-      catch (ex) { toast(ex?.message === 'noprf' ? 'Este dispositivo no lo permite. Podés seguir con la contraseña.' : 'No se activó. Podés hacerlo después en Ajustes.'); }
+      catch (ex) { bioError(ex); }
       return;
     }
     case 'sync-now': await syncNow(); return;
@@ -1797,13 +1837,11 @@ document.addEventListener('click', async e => {
       }
       return;
     }
-    case 'bio-enable': {
+    case 'bio-enable': case 'bio-confirm': {
       try {
-        await bio.enable(); toast(bio.label() + ' activado'); render();
-      } catch (ex) {
-        toast(ex?.message === 'noprf' ? 'Este dispositivo o navegador no permite desbloqueo biométrico para apps web.'
-          : ex?.name === 'NotAllowedError' ? 'Cancelado' : 'No se pudo activar ' + bio.label());
-      }
+        if (act === 'bio-confirm') { closeModal(); await bio.confirm(); } else await bio.enable();
+        toast(bio.label() + ' activado'); render();
+      } catch (ex) { bioError(ex); }
       return;
     }
     case 'bio-disable': await bio.disable(); toast(bio.label() + ' desactivado en este dispositivo'); render(); return;

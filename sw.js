@@ -1,5 +1,5 @@
 // Service worker: hace que la app funcione sin conexión.
-const CACHE = 'otra-escena-v8';
+const CACHE = 'otra-escena-v9';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/icon-maskable.png'];
 
@@ -27,7 +27,7 @@ self.addEventListener('fetch', e => {
       return res;
     }
     try {
-      const res = await fetch(req, { cache: 'no-cache' });
+      const res = await fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' });
       if (res.ok) cache.put(req, res.clone());
       return res;
     } catch {
