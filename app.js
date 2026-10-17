@@ -50,12 +50,13 @@ const ICONS = {
   honorarios: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6.5 9.5v.01M17.5 14.5v.01"/></svg>',
   buscar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg>',
   ajustes: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>',
+  cuaderno: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3H19v15H6.5A1.5 1.5 0 0 0 5 19.5z"/><path d="M5 19.5A1.5 1.5 0 0 0 6.5 21H19v-3M9 7.5h6M9 11h4"/></svg>',
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
 };
 
 const NAV = [
   ['inicio', 'Inicio'], ['agenda', 'Agenda'], ['pacientes', 'Pacientes'],
-  ['honorarios', 'Honorarios'], ['buscar', 'Buscar'], ['ajustes', 'Ajustes'],
+  ['honorarios', 'Honorarios'], ['cuaderno', 'Cuaderno'], ['buscar', 'Buscar'], ['ajustes', 'Ajustes'],
 ];
 
 /* ---------- Utilidades ---------- */
@@ -176,6 +177,7 @@ function defaultDB(nombre, titulo) {
     settings: { nombre, titulo, moneda: 'ARS', honorario: 0, duracion: 45, autolock: 15, iniciales: false, lastBackup: null },
     patients: [],
     sessions: [],
+    notes: [],
     borrador: null,
     _local: {},
   };
@@ -183,7 +185,7 @@ function defaultDB(nombre, titulo) {
 function migrate(d) {
   const base = defaultDB('', '');
   d.settings = { ...base.settings, ...(d.settings || {}) };
-  d.patients ||= []; d.sessions ||= [];
+  d.patients ||= []; d.sessions ||= []; d.notes ||= [];
   if (d.borrador === undefined) d.borrador = null;
   d._local ||= {};
   return d;
@@ -300,6 +302,7 @@ function pickFile(accept) {
    vinculación y la contraseña. Si dos dispositivos editan lo mismo, gana el cambio más reciente. */
 const SYNC_URL = 'https://otra-escena-sync.tra-scena-ync.workers.dev';
 const SYNC_SETTINGS = ['nombre', 'titulo', 'moneda', 'honorario', 'duracion'];
+const SYNC_COLLECTIONS = { patient: 'patients', session: 'sessions', note: 'notes' };
 let syncTimer = null, syncRunning = null, syncAgain = false, syncPendingRender = false;
 let syncStatus = { state: 'idle', error: null };
 let pendingJoin = null;
@@ -315,20 +318,21 @@ const hashData = d => cyrb53(JSON.stringify(d, (k, v) => (k === '_u' ? undefined
 function pickSettings(D) { const o = {}; for (const k of SYNC_SETTINGS) o[k] = D.settings[k]; return o; }
 function findLocal(D, id) {
   if (id === 'settings') return { kind: 'settings', data: pickSettings(D), u: D.settings._u || 0 };
-  let o = D.patients.find(x => x.id === id); if (o) return { kind: 'patient', data: o, u: o._u || 0 };
-  o = D.sessions.find(x => x.id === id); if (o) return { kind: 'session', data: o, u: o._u || 0 };
+  for (const [kind, coll] of Object.entries(SYNC_COLLECTIONS)) {
+    const o = D[coll].find(x => x.id === id);
+    if (o) return { kind, data: o, u: o._u || 0 };
+  }
   return null;
 }
 function localRecords(D) {
   const m = new Map([['settings', findLocal(D, 'settings')]]);
-  for (const p of D.patients) m.set(p.id, { kind: 'patient', data: p, u: p._u || 0 });
-  for (const s of D.sessions) m.set(s.id, { kind: 'session', data: s, u: s._u || 0 });
+  for (const [kind, coll] of Object.entries(SYNC_COLLECTIONS)) for (const o of D[coll]) m.set(o.id, { kind, data: o, u: o._u || 0 });
   return m;
 }
 function stamp(D, id, u) {
   if (id === 'settings') { D.settings._u = u; return; }
-  const o = D.patients.find(x => x.id === id) || D.sessions.find(x => x.id === id);
-  if (o) o._u = u;
+  const loc = findLocal(D, id);
+  if (loc) loc.data._u = u;
 }
 
 function applyRemote(D, st, rem) {
@@ -337,8 +341,7 @@ function applyRemote(D, st, rem) {
   if (rem.kind === 'tomb') {
     if (!loc) { st.hashes[rem.id] = 'x'; return false; }
     if (locDirty && loc.u > rem.u) return false;
-    D.patients = D.patients.filter(x => x.id !== rem.id);
-    D.sessions = D.sessions.filter(x => x.id !== rem.id);
+    for (const coll of Object.values(SYNC_COLLECTIONS)) D[coll] = D[coll].filter(x => x.id !== rem.id);
     st.hashes[rem.id] = 'x';
     return true;
   }
@@ -349,7 +352,8 @@ function applyRemote(D, st, rem) {
   delete st.tombs[rem.id];
   if (rem.kind === 'settings') Object.assign(D.settings, rem.data, { _u: rem.u });
   else {
-    const arr = rem.kind === 'patient' ? D.patients : D.sessions;
+    const arr = D[SYNC_COLLECTIONS[rem.kind]];
+    if (!arr) return false; // tipo de registro de una versión más nueva de la app
     const cur = arr.find(x => x.id === rem.id);
     // Se actualiza el mismo objeto para no romper referencias de lo que esté abierto en pantalla.
     if (cur) { for (const k of Object.keys(cur)) delete cur[k]; Object.assign(cur, rem.data, { _u: rem.u }); }
@@ -439,7 +443,8 @@ function syncNow({ full = false } = {}) {
     st.lastSync = new Date().toISOString();
     if (db === D) {
       await persist({ quiet: true });
-      if (changed) { if ($('#modal-root').innerHTML || $('#print-root')) syncPendingRender = true; else render(); }
+      const editing = $('#view')?.contains(document.activeElement) && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+      if (changed) { if ($('#modal-root').innerHTML || $('#print-root') || editing) syncPendingRender = true; else render(); }
     }
     setSyncStatus('ok');
   })().catch(e => { console.warn('sync', e); setSyncStatus('error', e); })
@@ -653,6 +658,7 @@ function showSetup() {
     db = defaultDB(f.get('nombre').trim() || 'Nico', f.get('titulo').trim());
     await persist();
     startSession();
+    openGuide();
   });
 }
 
@@ -748,7 +754,7 @@ function render() {
   if (!db) return;
   const { route, args, q } = parseRoute();
   const r = VIEWS[route] ? route : 'inicio';
-  $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.route === r || (r === 'paciente' && a.dataset.route === 'pacientes')));
+  $$('.nav a').forEach(a => a.classList.toggle('active', a.dataset.route === r || (r === 'paciente' && a.dataset.route === 'pacientes') || (r === 'nota' && a.dataset.route === 'cuaderno')));
   const view = $('#view');
   view.innerHTML = VIEWS[r].html(args, q);
   VIEWS[r].mount?.(view, args, q);
@@ -772,7 +778,8 @@ function sessionRow(s, { showPatient = true, showDate = false, snippet = false, 
   if (actions && s.estado === 'programada' && s.modalidad === 'online' && s.link && s.fecha >= todayStr()) acts.push(`<a class="btn small" href="${esc(s.link)}" target="_blank" rel="noopener">Entrar</a>`);
   if (actions && s.estado === 'programada' && s.fecha <= todayStr()) acts.push(`<button class="btn small" data-act="mark-done" data-id="${s.id}">✓ Realizada</button>`);
   if (actions && isPendiente(s)) acts.push(`<button class="btn small" data-act="cobrar" data-id="${s.id}">Cobrar</button>`);
-  const snip = snippet && (s.notas || s.suenos) ? `<span class="srow-snip">${esc((s.notas || s.suenos).slice(0, 220))}</span>` : '';
+  const snip = snippet && (s.notas || s.suenos) ? `<span class="srow-snip">${esc((s.notas || s.suenos).slice(0, 220))}</span>`
+    : showPatient && s.estado === 'programada' && p?.retomar ? `<span class="srow-snip srow-retomar">↺ ${esc(p.retomar.slice(0, 140))}</span>` : '';
   return `<div class="srow estado-${s.estado}">
     <button class="srow-open" data-act="edit-session" data-id="${s.id}">
       <span class="srow-time">${showDate && showPatient ? `<small>${fmtFecha(s.fecha, { day: 'numeric', month: 'short' })}</small>` : ''}${esc(s.hora || '—')}</span>
@@ -974,6 +981,12 @@ VIEWS.paciente = {
         ${!(p.alias || edad != null || p.telefono || p.email || p.motivo || p.notas || p.frecuencia) ? '<p class="muted full" style="margin:0">Sin datos de ficha todavía. Tocá “Editar” para completarla.</p>' : ''}
       </div>
 
+      <div class="section card retomar-card">
+        <div class="section-title" style="margin-bottom:6px"><h3>Para retomar</h3><small>aparece en su próxima sesión</small></div>
+        <textarea id="retomar-txt" rows="2" placeholder="Nada pendiente por ahora.">${esc(p.retomar || '')}</textarea>
+        <div class="row" style="margin-top:8px"><button class="btn small" data-act="save-retomar" data-id="${p.id}">Guardar</button>${p.retomar ? `<button class="btn small ghost" data-act="clear-retomar" data-id="${p.id}">Ya lo retomé</button>` : ''}</div>
+      </div>
+
       ${sigs.length ? `<div class="section"><div class="section-title"><h2>Significantes</h2><small>tocá uno para ver dónde aparece</small></div>
         <div class="chips">${sigs.map(g => `<a class="chip" href="#/buscar?q=${encodeURIComponent(g.label)}&p=${p.id}">${esc(g.label)}<small>${g.n}</small></a>`).join('')}</div></div>` : ''}
 
@@ -1024,6 +1037,19 @@ VIEWS.honorarios = {
           <td class="num">${money(e.f)}</td><td class="num">${money(e.c)}</td><td class="num">${e.f - e.c ? `<span class="badge warn">${money(e.f - e.c)}</span>` : '—'}</td></tr>`).join('')}
         </tbody></table></div></div>` : `<p class="empty">Sin sesiones cobrables este mes.</p>`}
 
+      ${(() => {
+        const meses = [...Array(12)].map((_, i) => { const d = new Date(y, m - 12 + i, 1); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; });
+        const tot = meses.map(k => sum(db.sessions.filter(s => s.fecha.startsWith(k) && isCobrable(s))));
+        const max = Math.max(...tot, 1), total12 = tot.reduce((a, b) => a + b, 0);
+        if (!total12) return '';
+        return `<div class="section card"><div class="section-title" style="margin-bottom:10px"><h3>Últimos 12 meses</h3><small>facturado hasta ${mesLabel}</small><span class="spacer"></span><b class="year-total">${money(total12)}</b></div>
+          <div class="year-bars" role="table" aria-label="Facturado por mes">
+            ${meses.map((k, i) => { const [yy, mm] = k.split('-').map(Number); const lbl = new Date(yy, mm - 1, 1).toLocaleDateString('es-AR', { month: 'short', year: '2-digit' });
+              return `<a class="yb-row ${k === ym ? 'current' : ''}" role="row" href="#/honorarios/${k}"><span class="yb-m" role="cell">${lbl}</span><span class="yb-track" role="cell"><span class="yb-bar" style="width:${tot[i] ? Math.max(1.5, tot[i] / max * 100) : 0}%"></span></span><span class="yb-v" role="cell">${tot[i] ? money(tot[i]) : '—'}</span></a>`; }).join('')}
+          </div>
+          <p class="hint" style="margin:10px 0 0">Útil para controlar el tope anual de tu categoría de monotributo.</p></div>`;
+      })()}
+
       <div class="section"><div class="section-title"><h2>Pendiente de cobro</h2><small>todos los meses · ${money(sum(pendientes))}</small></div>
         ${pendientes.length ? `<div class="slist">${pendientes.map(s => sessionRow(s, { showDate: true })).join('')}</div>` : '<p class="empty">Todo cobrado. ✨</p>'}
       </div>`;
@@ -1072,9 +1098,17 @@ function searchResults(q, pid) {
     const byName = findRanges(fullName(p), q).length;
     return hs || byName ? [`<a class="result" href="#/paciente/${p.id}" style="text-decoration:none;color:inherit"><div class="rhead"><b>${esc(fullName(p))}</b><span class="badge gold">Ficha</span></div>${hs}</a>`] : [];
   });
-  if (!out.length && !pats.length) return `<p class="empty">Sin resultados para “${esc(q)}”.</p>`;
-  return `<p class="muted" style="margin:14px 2px 0">${total} ${total === 1 ? 'aparición' : 'apariciones'} en ${out.length} ${out.length === 1 ? 'sesión' : 'sesiones'}</p>
-    <div class="results">${pats.join('')}${out.join('')}</div>`;
+  const notas = pid ? [] : db.notes.slice().sort((a, b) => (b.editado || '').localeCompare(a.editado || '')).flatMap(n => {
+    const rt = findRanges(n.titulo, q), rb = findRanges(n.cuerpo, q), rg = findRanges((n.etiquetas || []).join(', '), q);
+    if (!rt.length && !rb.length && !rg.length) return [];
+    total += rt.length + rb.length + rg.length;
+    return [`<a class="result" href="#/nota/${n.id}" style="text-decoration:none;color:inherit"><div class="rhead"><b>${rt.length ? snippetHTML(n.titulo, rt, 200) : esc(n.titulo || 'Sin título')}</b><span class="badge gold">Cuaderno</span></div>${rb.length ? `<p>${snippetHTML(n.cuerpo, rb)}</p>` : ''}</a>`];
+  });
+  if (!out.length && !pats.length && !notas.length) return `<p class="empty">Sin resultados para “${esc(q)}”.</p>`;
+  const donde = [out.length && `${out.length} ${out.length === 1 ? 'sesión' : 'sesiones'}`, pats.length && `${pats.length} ${pats.length === 1 ? 'ficha' : 'fichas'}`,
+    notas.length && `${notas.length} ${notas.length === 1 ? 'nota' : 'notas'} del cuaderno`].filter(Boolean);
+  return `<p class="muted" style="margin:14px 2px 0">${total ? `${total} ${total === 1 ? 'aparición' : 'apariciones'} en ` : ''}${donde.join(donde.length > 2 ? ', ' : ' y ').replace(/, ([^,]*)$/, ' y $1')}</p>
+    <div class="results">${pats.join('')}${out.join('')}${notas.join('')}</div>`;
 }
 VIEWS.buscar = {
   html(args, q) {
@@ -1101,6 +1135,77 @@ VIEWS.buscar = {
       render();
     });
     if (!qi.value && !('ontouchstart' in window)) qi.focus();
+  },
+};
+
+/* ---------- Cuaderno: notas personales de estudio, aparte de los pacientes ---------- */
+function noteTagCounts() {
+  const m = new Map();
+  for (const n of db.notes) for (const g of n.etiquetas || []) { const k = norm(g); const e = m.get(k) || { label: g, n: 0 }; e.n++; m.set(k, e); }
+  return [...m.values()].sort((a, b) => b.n - a.n || a.label.localeCompare(b.label, 'es'));
+}
+const noteFecha = n => n.editado ? new Date(n.editado).toLocaleDateString('es-AR', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+
+VIEWS.cuaderno = {
+  html(args, q) {
+    // Las notas creadas y abandonadas sin escribir nada no se guardan.
+    const vacias = db.notes.filter(n => !(n.titulo || '').trim() && !(n.cuerpo || '').trim());
+    if (vacias.length) { db.notes = db.notes.filter(n => !vacias.includes(n)); save(); }
+    const tag = q.get('t') || '';
+    const list = db.notes.filter(n => !tag || (n.etiquetas || []).some(e => norm(e) === norm(tag)))
+      .sort((a, b) => (b.editado || '').localeCompare(a.editado || ''));
+    const tags = noteTagCounts();
+    return `
+      <div class="page-head"><h1>Cuaderno</h1><button class="btn primary" data-act="new-note">+ Nueva nota</button></div>
+      <p class="muted" style="margin:-8px 2px 16px">Lecturas, seminarios, ideas sueltas. Aparte de los pacientes.</p>
+      ${db.notes.length ? `<input class="search" id="nfilter" type="search" placeholder="Buscar en el cuaderno…" autocomplete="off">` : ''}
+      ${tags.length ? `<div class="chips" style="margin-top:12px">
+        <a class="chip ${tag ? '' : 'active'}" href="#/cuaderno">Todas</a>
+        ${tags.map(g => `<a class="chip ${norm(g.label) === norm(tag) ? 'active' : ''}" href="#/cuaderno?t=${encodeURIComponent(g.label)}">${esc(g.label)}<small>${g.n}</small></a>`).join('')}</div>` : ''}
+      ${list.length ? `<div class="notes-grid">${list.map(n => `
+        <a class="note-card" href="#/nota/${n.id}" data-text="${esc(norm((n.titulo || '') + ' ' + (n.cuerpo || '') + ' ' + (n.etiquetas || []).join(' ')))}">
+          <b>${esc(n.titulo || 'Sin título')}</b>
+          <span class="note-snip">${esc((n.cuerpo || '').slice(0, 300))}</span>
+          <small>${noteFecha(n)}${n.etiquetas?.length ? ' · ' + esc(n.etiquetas.join(', ')) : ''}</small>
+        </a>`).join('')}</div>`
+        : `<p class="empty">${db.notes.length ? 'No hay notas con esa etiqueta.' : 'Un lugar para tus lecturas: el tomo XIII, Recalcati, lo que quede de un seminario.'}</p>`}`;
+  },
+  mount(view) {
+    const inp = $('#nfilter', view);
+    inp?.addEventListener('input', () => {
+      const v = norm(inp.value.trim());
+      $$('.note-card', view).forEach(c => { c.hidden = v && !c.dataset.text.includes(v); });
+    });
+  },
+};
+
+VIEWS.nota = {
+  html([id]) {
+    const n = db.notes.find(x => x.id === id);
+    if (!n) return `<a class="back" href="#/cuaderno">‹ Cuaderno</a><p class="empty">Esta nota ya no existe.</p>`;
+    return `<a class="back" href="#/cuaderno">‹ Cuaderno</a>
+      <div class="note-editor">
+        <input id="n-title" class="note-title" placeholder="Título" value="${esc(n.titulo)}" autocomplete="off">
+        <input id="n-tags" class="note-tags" placeholder="Etiquetas, separadas por coma: Freud, seminario, sueños" value="${esc((n.etiquetas || []).join(', '))}" autocomplete="off">
+        <textarea id="n-body" class="note-body" placeholder="Escribí…">${esc(n.cuerpo)}</textarea>
+        <div class="row"><small class="muted" id="n-saved">${n.cuerpo || n.titulo ? 'Editada el ' + noteFecha(n) : 'Se guarda sola mientras escribís.'}</small><span class="spacer"></span>
+          <button class="btn small ghost danger" data-act="delete-note" data-id="${n.id}">Borrar nota</button></div>
+      </div>`;
+  },
+  mount(view, [id]) {
+    const n = db.notes.find(x => x.id === id); if (!n) return;
+    const ti = $('#n-title', view), tg = $('#n-tags', view), bd = $('#n-body', view);
+    let t;
+    const upd = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        n.titulo = ti.value.trim(); n.cuerpo = bd.value; n.etiquetas = splitSigs(tg.value);
+        n.editado = new Date().toISOString();
+        save(); $('#n-saved', view).textContent = 'Guardado';
+      }, 500);
+    };
+    [ti, tg, bd].forEach(el => el.addEventListener('input', upd));
+    if (!n.titulo && !n.cuerpo) ti.focus();
   },
 };
 
@@ -1153,7 +1258,7 @@ VIEWS.ajustes = {
       <div class="section card stack">
         <h3>Seguridad</h3>
         <p class="muted" style="margin:0">Cifrado AES-256-GCM con clave derivada de tu contraseña (PBKDF2, ${KDF_ITER.toLocaleString('es-AR')} iteraciones). Nada sale de este dispositivo.</p>
-        <div class="row"><button class="btn" data-act="change-pass">Cambiar contraseña</button><button class="btn" data-act="lock">Bloquear ahora</button></div>
+        <div class="row"><button class="btn" data-act="change-pass">Cambiar contraseña</button><button class="btn" data-act="lock">Bloquear ahora</button><button class="btn ghost" data-act="guia">Ver la guía otra vez</button></div>
       </div>
 
       <div class="section card about">
@@ -1252,6 +1357,7 @@ function readSessionForm(form) {
     estado: f.get('estado'), honorario: Number(f.get('honorario')) || 0, pagado: f.get('pagado') === 'on',
     medio: f.get('medio'), notas: f.get('notas') || '', suenos: f.get('suenos') || '', lapsus: f.get('lapsus') || '',
     significantes: splitSigs(f.get('significantes')), repetir: Number(f.get('repetir')) || 0,
+    retomar: String(f.get('retomar') ?? '').trim(),
   };
 }
 
@@ -1297,6 +1403,8 @@ function openSessionModal({ id = null, fecha = null, patientId = null, draft = n
     <label>Significantes <input name="significantes" value="${esc((d.significantes || []).join(', '))}" placeholder="Separados por coma: mirada, caída, padre" autocomplete="off">
       <span class="hint">Quedan indexados para seguirlos a lo largo del tratamiento.</span></label>
     <div class="chips" id="sig-chips">${sigChips(pid)}</div>
+    <label class="retomar-field">Para retomar en la próxima sesión <textarea name="retomar" rows="2" placeholder="Algo que quedó abierto, una pregunta, un detalle a no perder…">${esc(draft?.retomar ?? p0?.retomar ?? '')}</textarea>
+      <span class="hint">Queda en la ficha del paciente y aparece cuando abras su próxima sesión.</span></label>
     ${!s ? `<label>Repetir <select name="repetir"><option value="0">Solo esta sesión</option>${[4, 8, 12, 26, 52].map(n => `<option value="${n}">Semanalmente, ${n} semanas</option>`).join('')}</select></label>` : ''}
     <footer class="modal-foot">
       ${s ? `<button type="button" class="btn ghost danger" data-act="delete-session" data-id="${s.id}">Eliminar</button>` : ''}
@@ -1321,6 +1429,7 @@ function openSessionModal({ id = null, fecha = null, patientId = null, draft = n
       el('patientId').addEventListener('change', () => {
         const p = patientById(el('patientId').value);
         $('#sig-chips', form).innerHTML = sigChips(el('patientId').value);
+        el('retomar').value = patientById(el('patientId').value)?.retomar || '';
         if (s || !p) return;
         el('modalidad').value = p.modalidad || 'presencial';
         el('link').value = p.link || '';
@@ -1337,6 +1446,9 @@ function openSessionModal({ id = null, fecha = null, patientId = null, draft = n
         e.preventDefault();
         const data = readSessionForm(form);
         const rep = data.repetir; delete data.repetir;
+        const ret = data.retomar; delete data.retomar;
+        const pp = patientById(data.patientId);
+        if (pp && (pp.retomar || '') !== ret) pp.retomar = ret;
         if (s) Object.assign(s, data, { fechaPago: data.pagado ? (s.fechaPago || todayStr()) : null });
         else {
           const n = Math.max(1, rep);
@@ -1460,6 +1572,50 @@ function exportHistory(pid) {
   confirmDialog('El archivo de texto NO está cifrado. Guardalo en un lugar seguro.', 'Exportar', false).then(ok => {
     if (ok) shareOrDownload(`historia-${norm(fullName(p)).replace(/[^a-z0-9]+/g, '-')}.txt`, L.join('\n'), 'text/plain');
   });
+}
+
+/* ---------- Guía de bienvenida ---------- */
+let guideStep = 0, guideBioOk = false;
+function guideSteps() {
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad/.test(ua) || (/Macintosh/.test(ua) && 'ontouchend' in document);
+  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  const steps = [];
+  if (!standalone) steps.push({
+    icon: '📲', t: 'Instalala',
+    b: ios ? 'En Safari tocá <b>Compartir</b> y después <b>“Agregar a pantalla de inicio”</b>. Así queda como una app más, funciona sin internet y el iPhone no borra tus datos.'
+      : 'Usá el ícono de <b>instalar</b> que aparece en la barra de direcciones del navegador. Queda como una app más y funciona sin internet.',
+  });
+  steps.push(
+    { icon: '☾', t: 'Tu consultorio', b: 'En <b>Pacientes</b> cargás cada ficha. Desde ahí o desde la <b>Agenda</b> creás las sesiones, presenciales u online, y podés repetirlas cada semana. En <b>Honorarios</b> ves lo cobrado y lo pendiente.' },
+    { icon: '✎', t: 'Notas y significantes', b: 'Cada sesión tiene sus notas, un lugar para sueños y lapsus, y los <b>significantes</b> que vayas marcando. En <b>Buscar</b> encontrás dónde apareció cada uno a lo largo del tratamiento. Y <b>“Para retomar”</b> te deja una nota para la próxima sesión.' },
+    { icon: '🔒', t: 'Solo vos', b: 'Todo se guarda cifrado con tu contraseña: nadie más puede leerlo. La app se bloquea sola si no la usás un rato. Importante: <b>si olvidás la contraseña, los datos no se pueden recuperar</b>.' },
+  );
+  if (guideBioOk) steps.push({ icon: '◉', t: bio.label(), b: `Para no escribir la contraseña cada vez, activá ${bio.label()} en este dispositivo. La contraseña sigue sirviendo siempre.`, bio: true });
+  steps.push(
+    { icon: '⇄', t: 'Tus otros dispositivos', b: 'Si la usás en el celular y en la compu, activá la <b>sincronización</b> en Ajustes: todo viaja cifrado. Y de vez en cuando hacé un <b>backup</b>, tu copia de seguridad.' },
+    { icon: '📖', t: 'Y algo más', b: 'El <b>Cuaderno</b> es para vos: lecturas, seminarios, ideas sueltas. Y para supervisar un caso, en la ficha del paciente está <b>“Para supervisión”</b>, que arma un documento sin datos que lo identifiquen.' },
+  );
+  return steps;
+}
+async function openGuide() { guideBioOk = await bio.available(); guideGo(0); }
+async function guideGo(i) {
+  const steps = guideSteps();
+  guideStep = Math.max(0, Math.min(i, steps.length - 1));
+  const st = steps[guideStep], last = guideStep === steps.length - 1;
+  const bioOn = st.bio && await idb.get('bio');
+  openModal(`<div class="guide">
+    <div class="guide-icon">${st.icon}</div>
+    <h2>${esc(st.t)}</h2>
+    <p>${st.b}</p>
+    ${st.bio ? (bioOn ? '<span class="badge ok">Activado en este dispositivo</span>' : `<button class="btn primary" data-act="guia-bio">Activar ${bio.label()}</button>`) : ''}
+    <div class="guide-dots" aria-label="Paso ${guideStep + 1} de ${steps.length}">${steps.map((_, k) => `<span class="${k === guideStep ? 'on' : ''}"></span>`).join('')}</div>
+    <footer class="modal-foot">
+      ${guideStep > 0 ? `<button class="btn ghost" data-act="guia-nav" data-step="${guideStep - 1}">Atrás</button>` : `<button class="btn ghost" data-act="guia-fin">Saltar</button>`}
+      <span class="spacer"></span>
+      ${last ? `<button class="btn primary" data-act="guia-fin">Empezar</button>`
+      : `<button class="btn ${st.bio && !bioOn ? 'ghost' : 'primary'}" data-act="guia-nav" data-step="${guideStep + 1}">${st.bio && !bioOn ? 'Más tarde' : 'Siguiente'}</button>`}
+    </footer></div>`, { narrow: true });
 }
 
 /* ---------- Supervisión: caso anonimizado listo para imprimir o guardar en PDF ---------- */
@@ -1587,6 +1743,27 @@ document.addEventListener('click', async e => {
       render(); return;
     }
     case 'sync-join': return openJoinModal();
+    case 'save-retomar': case 'clear-retomar': {
+      const pp = patientById(id); if (!pp) return;
+      pp.retomar = act === 'clear-retomar' ? '' : $('#retomar-txt').value.trim();
+      save(); render(); toast(act === 'clear-retomar' ? 'Listo' : 'Guardado'); return;
+    }
+    case 'new-note': {
+      const n = { id: uid(), titulo: '', cuerpo: '', etiquetas: [], creado: new Date().toISOString(), editado: new Date().toISOString() };
+      db.notes.push(n); save(); location.hash = '#/nota/' + n.id; return;
+    }
+    case 'delete-note': {
+      if (!(await confirmDialog('¿Borrar esta nota? No se puede deshacer.', 'Borrar'))) return;
+      db.notes = db.notes.filter(n => n.id !== id); save(); location.hash = '#/cuaderno'; toast('Nota borrada'); return;
+    }
+    case 'guia': return openGuide();
+    case 'guia-nav': return guideGo(Number(t.dataset.step));
+    case 'guia-fin': db.settings.guiaVista = true; save(); closeModal(); return;
+    case 'guia-bio': {
+      try { await bio.enable(); toast(bio.label() + ' activado'); guideGo(guideStep); }
+      catch (ex) { toast(ex?.message === 'noprf' ? 'Este dispositivo no lo permite. Podés seguir con la contraseña.' : 'No se activó. Podés hacerlo después en Ajustes.'); }
+      return;
+    }
     case 'sync-now': await syncNow(); return;
     case 'sync-share': {
       const url = syncLink();

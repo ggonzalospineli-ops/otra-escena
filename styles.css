@@ -416,3 +416,53 @@ body.printing #app, body.printing #modal-root { display: none; }
   .print-doc { box-shadow: none; padding: 0; max-width: none; border-radius: 0; }
   @page { margin: 2cm; }
 }
+
+/* ---------- Para retomar ---------- */
+.retomar-card { border-left: 4px solid var(--gold); }
+.retomar-card textarea, .retomar-field textarea { font-family: var(--serif); font-size: 1.1rem; }
+.retomar-field textarea { background: var(--gold-soft); border-color: transparent; color: var(--ink); }
+.srow-retomar { color: var(--gold); font-style: italic; font-family: var(--serif); font-size: .98rem; -webkit-line-clamp: 1; }
+
+/* ---------- Honorarios: últimos 12 meses ---------- */
+.year-total { font-family: var(--serif); font-size: 1.4rem; font-weight: 600; }
+.year-bars { display: flex; flex-direction: column; gap: 2px; }
+.yb-row { display: grid; grid-template-columns: 64px minmax(0, 1fr) 110px; gap: 12px; align-items: center; padding: 4px 6px; border-radius: 6px; text-decoration: none; color: inherit; font-variant-numeric: tabular-nums; }
+.yb-row:hover { background: var(--surface-2); }
+.yb-m { font-size: .85rem; color: var(--muted); }
+.yb-m::first-letter { text-transform: uppercase; }
+.yb-track { display: block; height: 12px; }
+.yb-bar { display: block; height: 100%; background: var(--gold); border-radius: 0 4px 4px 0; opacity: .7; }
+.yb-v { text-align: right; font-size: .9rem; }
+.yb-row.current .yb-bar { opacity: 1; }
+.yb-row.current .yb-m, .yb-row.current .yb-v { color: var(--ink); font-weight: 600; }
+@media (max-width: 520px) { .yb-row { grid-template-columns: 52px minmax(0, 1fr) 92px; gap: 8px; } }
+
+/* ---------- Cuaderno ---------- */
+.notes-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 16px; }
+.note-card { display: flex; flex-direction: column; gap: 6px; min-height: 150px; padding: 16px 18px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); text-decoration: none; color: inherit; }
+.note-card:hover { border-color: var(--gold); }
+.note-card b { font-family: var(--serif); font-size: 1.3rem; font-weight: 600; line-height: 1.2; }
+.note-snip { color: var(--muted); font-family: var(--serif); font-size: 1.05rem; white-space: pre-line; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
+.note-card small { margin-top: auto; color: var(--muted); font-size: .78rem; }
+.chip.active { background: var(--gold); color: #fff; }
+@media (prefers-color-scheme: dark) { .chip.active { color: #1a1608; } .chip.active small { color: inherit; } }
+.note-editor { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 6px; }
+.note-editor input, .note-editor textarea { background: transparent; border: 0; border-radius: 0; padding: 6px 0; }
+.note-editor input:focus, .note-editor textarea:focus { outline: none; }
+.note-editor .note-title { font-family: var(--serif); font-size: 2.2rem; font-weight: 600; }
+.note-editor .note-tags { font-size: .9rem; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.note-editor .note-body { font-family: var(--serif); font-size: 1.25rem; line-height: 1.6; min-height: 60vh; resize: vertical; }
+
+/* ---------- Guía de bienvenida ---------- */
+.guide { text-align: center; padding: 12px 4px 0; }
+.guide-icon { font-size: 2.6rem; color: var(--gold); line-height: 1; margin-bottom: 12px; }
+.guide h2 { margin-bottom: 10px; }
+.guide p { line-height: 1.6; margin: 0 auto 16px; max-width: 36ch; }
+.guide-dots { display: flex; gap: 6px; justify-content: center; margin-top: 20px; }
+.guide-dots span { width: 7px; height: 7px; border-radius: 4px; background: var(--line); transition: width .2s; }
+.guide-dots span.on { width: 20px; background: var(--gold); }
+
+/* El menú de abajo del celular ahora tiene 7 secciones */
+@media (max-width: 760px) {
+  .nav a { font-size: 9.5px; padding: 6px 1px; }
+}
