@@ -649,7 +649,33 @@ function lockShell(inner) {
   $('#app').innerHTML = `<div class="lock"><div class="lock-card">${inner}</div></div>`;
 }
 
+/* ---------- Video de bienvenida ---------- */
+function playIntro(after) {
+  const ov = document.createElement('div');
+  ov.className = 'intro';
+  ov.innerHTML = `<video src="media/bienvenida.mp4" playsinline preload="auto"></video>
+    <p class="intro-hint">Girá el teléfono para verlo más grande</p>
+    <button class="btn intro-skip" type="button">Saltar</button>`;
+  document.body.appendChild(ov);
+  const v = $('video', ov);
+  let finished = false;
+  const done = () => { if (finished) return; finished = true; ov.classList.add('out'); setTimeout(() => ov.remove(), 400); after?.(); };
+  v.addEventListener('ended', done);
+  v.addEventListener('error', done);
+  $('.intro-skip', ov).addEventListener('click', done);
+  // Se llama desde un toque, así que el navegador deja reproducir con sonido.
+  v.play().catch(() => { v.muted = true; v.controls = true; v.play().catch(done); });
+}
+
 function showWelcome() {
+  lockShell(`
+    <div class="lock-moon">☾</div>
+    <p class="lock-sub" style="margin-bottom:30px">Un regalo para vos</p>
+    <button class="btn primary" data-act="intro" style="width:100%">Abrir el regalo</button>
+    <button class="btn ghost" data-act="join-first" style="margin-top:12px;width:100%">Ya la uso en otro dispositivo</button>`);
+}
+
+function showDedication() {
   lockShell(`
     <div class="lock-moon">☾</div>
     <p class="lock-sub" style="margin-bottom:18px">Un regalo para vos</p>
@@ -657,7 +683,7 @@ function showWelcome() {
     <div class="dedicatoria-firma">— ${esc(DEDICATORIA.firma)}</div>
     <div style="margin-top:34px;display:flex;flex-direction:column;gap:10px">
       <button class="btn primary" data-act="setup">Empezar</button>
-      <button class="btn ghost" data-act="join-first">Ya la uso en otro dispositivo</button>
+      <button class="btn ghost" data-act="intro-again">Ver el video otra vez</button>
     </div>`);
 }
 
@@ -1302,7 +1328,8 @@ VIEWS.ajustes = {
         <div class="dedicatoria">${esc(DEDICATORIA.texto)}</div>
         <div class="dedicatoria-firma">— ${esc(DEDICATORIA.firma)}</div>
         <div class="estampitas">${estampita('San Freud', 'patrono de los sueños', 'F')}${estampita('San Lacan', 'patrono del significante', 'L')}</div>
-        <p class="muted" style="font-size:.8rem;margin-top:18px">Otra Escena · <i>der andere Schauplatz</i></p>
+        <p style="margin-top:16px"><button class="btn small ghost" data-act="intro-about">Ver el video de bienvenida</button></p>
+        <p class="muted" style="font-size:.8rem;margin-top:12px">Otra Escena · <i>der andere Schauplatz</i></p>
       </div>`;
   },
   mount(view) {
@@ -1774,6 +1801,9 @@ document.addEventListener('click', async e => {
   const { act, id } = t.dataset;
   switch (act) {
     case 'setup': return showSetup();
+    case 'intro': return playIntro(showDedication);
+    case 'intro-again': return playIntro();
+    case 'intro-about': return playIntro();
     case 'join-first': return showJoinFirst(pendingJoin || '');
     case 'welcome': return showWelcome();
     case 'sync-enable': {
