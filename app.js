@@ -653,14 +653,13 @@ function lockShell(inner) {
 function playIntro(after) {
   const ov = document.createElement('div');
   ov.className = 'intro';
-  ov.innerHTML = `<video src="media/bienvenida.mp4" playsinline preload="auto"></video>
+  ov.innerHTML = `<video src="media/bienvenida.mp4" playsinline preload="auto" loop></video>
     <p class="intro-hint">Girá el teléfono para verlo más grande</p>
-    <button class="btn intro-skip" type="button">Saltar</button>`;
+    <button class="btn intro-skip" type="button">Continuar ›</button>`;
   document.body.appendChild(ov);
   const v = $('video', ov);
   let finished = false;
   const done = () => { if (finished) return; finished = true; ov.classList.add('out'); setTimeout(() => ov.remove(), 400); after?.(); };
-  v.addEventListener('ended', done);
   v.addEventListener('error', done);
   $('.intro-skip', ov).addEventListener('click', done);
   // Se llama desde un toque, así que el navegador deja reproducir con sonido.

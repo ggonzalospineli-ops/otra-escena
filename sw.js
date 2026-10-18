@@ -1,5 +1,5 @@
 // Service worker: hace que la app funcione sin conexión.
-const CACHE = 'otra-escena-v10';
+const CACHE = 'otra-escena-v11';
 const ASSETS = ['./', './index.html', './styles.css', './app.js', './manifest.webmanifest',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/icon-maskable.png'];
 
